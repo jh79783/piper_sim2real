@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local reference checkout and generated training artifacts
+/reference/
+/runs/

@@ -1,0 +1,31 @@
+# GPU/RSL-RL dependency set for the derivative localhost/piper-rsl:gpu image.
+#
+# The base image supplies the CUDA build of PyTorch 2.10.0.  Containerfile.rsl
+# installs torchvision 0.25.0 from the matching cu128 index before installing
+# this file; keeping those two packages out of this list prevents pip from
+# replacing the CUDA wheels with a CPU wheel from the default index.
+#
+# This is the established mjlab 1.3-era stack used by reference/microduck_rl,
+# selected because its direct MuJoCo-Warp API is stable and does not pull in
+# mjlab itself:
+#   mujoco 3.10.0 + mujoco-warp 3.8.1 + warp-lang 1.12.0
+#   rsl-rl-lib 5.0.1 + tensordict 0.10.0
+#
+# mujoco-warp 3.8.1 declares mujoco>=3.8.0 and warp-lang>=1.12; rsl-rl-lib
+# 5.0.1 declares torch>=2.6, torchvision>=0.5, tensordict>=0.7,
+# onnxscript>=0.5.4, and GitPython.  Those transitive requirements are left
+# for pip to resolve unless pinned below because they are pure-Python/support
+# packages and do not select a physics or CUDA implementation.
+mujoco==3.10.0
+mujoco-warp==3.8.1
+warp-lang==1.12.0
+
+rsl-rl-lib==5.0.1
+tensordict==0.10.0
+onnx==1.22.0
+onnxscript==0.5.7
+
+# RSL-RL's logger writes TensorBoard event files.  The base image already has
+# TensorBoard, but pinning it here keeps a freshly rebuilt derivative image
+# aligned with the reference lock.
+tensorboard==2.20.0

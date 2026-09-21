@@ -1,0 +1,36 @@
+# RSL-RL + MuJoCo-Warp derivative image.
+#
+# Keep Containerfile and localhost/piper-rl:gpu untouched.  The existing image
+# already contains Ubuntu 24.04/Python 3.12 and torch 2.10.0+cu128, so this
+# derivative only replaces SB3 and adds the direct MuJoCo-Warp/RSL stack.
+FROM localhost/piper-rl:gpu
+
+ENV PYTHONUNBUFFERED=1
+
+# RSL-RL 5.0.1 declares torchvision>=0.5.  Install the torchvision wheel from
+# the same PyTorch CUDA index as the torch wheel in the parent image.  --no-deps
+# is intentional: torch itself is inherited from the cached parent layer.
+RUN python -m pip install --no-cache-dir --no-deps \
+    torchvision==0.25.0 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+COPY requirements-rsl.txt /tmp/requirements-rsl.txt
+
+# Stable-Baselines3 is intentionally absent from the RSL image.  Keep the old
+# image as the SB3-compatible environment and use this image for the RSL path.
+RUN python -m pip uninstall -y stable-baselines3 \
+    && python -m pip install --no-cache-dir -r /tmp/requirements-rsl.txt \
+    && python -m pip check \
+    && rm -f /tmp/requirements-rsl.txt
+
+# GitPython (an rsl-rl-lib runtime dependency) invokes the git executable when
+# constructing the repository/version metadata used by the RSL logger.  The
+# base image does not include it, so install the small system dependency in a
+# separate late layer to preserve all Python download/build cache hits.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -c "from rsl_rl.runners import OnPolicyRunner; print(OnPolicyRunner.__name__)"
+
+WORKDIR /workspace
+CMD ["bash"]

@@ -1,0 +1,179 @@
+"""Headless physics checks for the contact-based Piper task.
+
+The oracle in this file is intentionally a validation aid, not a policy claim.
+It sends normal Cartesian actions through :meth:`PiperPickPlaceEnv.step` and
+therefore exercises the same position actuators and contacts as training.
+"""
+
+import numpy as np
+import unittest
+
+from scripts.piper_pick_place_env import PiperPickPlaceEnv
+
+
+def _action_towards(env, target, gripper):
+    """Convert a Cartesian target into one bounded environment action."""
+
+    target = np.asarray(target, dtype=np.float64)
+    arm_action = np.clip(
+        (target - env.target_position) / env.action_scale,
+        -1.0,
+        1.0,
+    )
+    grip_action = np.clip(
+        (gripper - env.gripper_target) / 0.008,
+        -1.0,
+        1.0,
+    )
+    return np.r_[arm_action, grip_action]
+
+
+def _drive(env, target, gripper, steps):
+    """Drive one phase, stopping if the task terminates."""
+
+    trace = []
+    for _ in range(steps):
+        result = env.step(_action_towards(env, target, gripper))
+        trace.append((env._finger_contacts().copy(), env.cube_position.copy(), result[4]))
+        if result[2] or result[3]:
+            break
+    return trace
+
+
+def _oracle(env):
+    """Run a deterministic physical pick/place sequence from above-cube reset."""
+
+    cube_xy = env.cube_position[:2].copy()
+    goal_xy = env.goal_position[:2].copy()
+    phases = (
+        (np.r_[cube_xy, 0.026], 0.035, 40),  # descend with the fingers open
+        (np.r_[cube_xy, 0.026], 0.0, 30),  # close around the cube
+        (np.r_[cube_xy, 0.12], 0.0, 50),  # lift while closed
+        (np.r_[goal_xy, 0.12], 0.0, 60),  # carry above the goal
+        (np.r_[goal_xy, 0.026], 0.0, 40),  # lower onto the table
+        (np.r_[goal_xy, 0.026], 0.035, 30),  # release
+        (np.r_[goal_xy, 0.12], 0.035, 40),  # retreat (usually terminal first)
+    )
+    trace = []
+    for target, gripper, steps in phases:
+        trace.extend(_drive(env, target, gripper, steps))
+        if trace[-1][2]["is_success"] or env.episode_steps >= env.max_episode_steps:
+            break
+    return trace
+
+
+class PiperPickPlaceTests(unittest.TestCase):
+    def test_reset_randomizes_cube_and_goal_reproducibly(self):
+        first = PiperPickPlaceEnv()
+        second = PiperPickPlaceEnv()
+        samples = []
+        try:
+            for seed in range(8):
+                first.reset(seed=seed)
+                second.reset(seed=seed)
+                np.testing.assert_allclose(first.cube_position, second.cube_position)
+                np.testing.assert_allclose(first.goal_position, second.goal_position)
+                samples.append(np.r_[first.cube_position[:2], first.goal_position[:2]])
+                self.assertGreater(np.linalg.norm(first.cube_position[:2] - first.goal_position[:2]), 0.13)
+            samples = np.asarray(samples)
+            self.assertGreater(np.unique(samples[:, :2], axis=0).shape[0], 1)
+            self.assertGreater(np.unique(samples[:, 2:], axis=0).shape[0], 1)
+            # The two samplers are independent, not one fixed offset copied per episode.
+            self.assertGreater(np.unique(samples[:, 2:] - samples[:, :2], axis=0).shape[0], 1)
+        finally:
+            first.close()
+            second.close()
+
+    def test_observation_and_action_state_remain_finite(self):
+        env = PiperPickPlaceEnv()
+        try:
+            observation, info = env.reset(seed=3)
+            self.assertEqual(observation.shape, (58,))
+            self.assertEqual(observation.dtype, np.float32)
+            self.assertTrue(np.isfinite(observation).all())
+            self.assertFalse(info["is_success"])
+            for action in (np.zeros(4), np.ones(4), -np.ones(4)):
+                observation, reward, terminated, truncated, info = env.step(action)
+                self.assertTrue(np.isfinite(observation).all())
+                self.assertTrue(np.isfinite(reward))
+                self.assertFalse(terminated or truncated)
+                self.assertTrue(np.isfinite(env.data.qpos).all())
+                self.assertTrue(np.isfinite(env.data.qvel).all())
+                self.assertTrue(np.isfinite(info["ik_error"]))
+        finally:
+            env.close()
+
+    def test_contact_oracle_physically_picks_lifts_and_places(self):
+        # Three layouts cover positive/negative y and a near-minimum allowed
+        # cube-goal separation while keeping this regression test quick.
+        for seed in (0, 7, 19):
+            env = PiperPickPlaceEnv()
+            try:
+                env.reset(seed=seed)
+                trace = _oracle(env)
+                self.assertTrue(trace, "oracle did not advance")
+                had_bilateral_contact = any(contacts.all() for contacts, _, _ in trace)
+                had_lift = any(
+                    contacts.all() and cube[2] > env.cube_half_size + 0.05
+                    for contacts, cube, _ in trace
+                )
+                self.assertTrue(had_bilateral_contact)
+                self.assertTrue(had_lift)
+                info = env._info()
+                self.assertTrue(info["is_success"])
+                self.assertTrue(info["has_lifted"])
+                self.assertTrue(info["inside_goal"])
+                self.assertTrue(info["released"])
+                self.assertTrue(info["on_table"])
+                self.assertTrue(info["object_still"])
+            finally:
+                env.close()
+
+    def test_success_rejects_pushing_holding_and_border_overlap(self):
+        env = PiperPickPlaceEnv()
+        try:
+            env.reset(seed=0)
+
+            # Pushing a resting cube into the goal has no lift history and is not
+            # a successful placement, even when the final AABB is inside.
+            env.goal_position[:2] = env.cube_position[:2]
+            env.has_lifted = False
+            env.stable_steps = 0
+            inside, on_table, still, released = env._placement_state()
+            self.assertTrue(inside and on_table and still and released)
+            self.assertFalse(env._info()["is_success"])
+
+            # A cube carried into the goal while both finger pads touch it is still
+            # a hold, not a release.  The public success state remains false.
+            env.reset(seed=0)
+            cube_xy = env.cube_position[:2].copy()
+            _drive(env, np.r_[cube_xy, 0.026], 0.035, 40)
+            _drive(env, np.r_[cube_xy, 0.026], 0.0, 30)
+            env.goal_position[:2] = cube_xy
+            env.has_lifted = True
+            inside, _, _, released = env._placement_state()
+            self.assertTrue(inside and not released)
+            self.assertFalse(env._info()["is_success"])
+
+            # Geometric overlap is not enough: the complete rotated cube AABB
+            # must fit, with the configured two-millimetre safety margin.
+            env.reset(seed=0)
+            env.goal_position[:2] = env.cube_position[:2]
+            env.data.qpos[env.cube_qadr : env.cube_qadr + 3] = [
+                env.goal_position[0] + env.goal_half_size[0] - env.cube_half_size + 0.001,
+                env.goal_position[1],
+                env.cube_half_size,
+            ]
+            mujoco_forward = __import__("mujoco")
+            mujoco_forward.mj_forward(env.model, env.data)
+            env.has_lifted = True
+            env.stable_steps = 0
+            inside, _, _, _ = env._placement_state()
+            self.assertFalse(inside)
+            self.assertFalse(env._info()["is_success"])
+        finally:
+            env.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
