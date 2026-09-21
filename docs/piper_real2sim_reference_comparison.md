@@ -9,10 +9,11 @@ Piper의 실측 데이터를 시뮬레이션에 반영하는 real2sim과, 시뮬
 로컬 `reference/`는 이 저장소에 포함하지 않으며, 레퍼런스 링크는 비교에 사용한
 원본 커밋을 가리킨다.
 
-## 작성 시점의 코드 상태
+## 작성 시점의 코드 상태 (역사적 스냅샷)
 
-아래 비교표는 대화 당시의 **초기 Piper 구현(SB3 + CPU MuJoCo)**을 기준으로
-보존한 것이다. 작성 시점에는 기본 Piper 실행 경로가 이미 변경되어 있다.
+아래 표는 대화 당시의 **초기 Piper 구현(SB3 + CPU MuJoCo)**을 기준으로
+보존한 역사적 스냅샷이다. 아래의 현재 구성 표와 섞어 읽지 않도록 이 표의
+25Hz·동일 관측 입력·고정 물리 값은 과거 상태를 설명한다.
 
 | 항목 | 작성 시점의 기본 Piper 경로 |
 | --- | --- |
@@ -25,10 +26,34 @@ Piper의 실측 데이터를 시뮬레이션에 반영하는 real2sim과, 시뮬
 | 정책 실행 주기 | 25Hz 유지: 물리 2ms × 20스텝 |
 | 저장·배포 | RSL-RL `model.pt` 및 중간 체크포인트 저장. 프로젝트의 ONNX 내보내기·실기 비교 경로는 아직 없음 |
 
-즉, 초기 비교의 CPU 물리 계산과 관측 정규화 관련 차이는 현재 기본 경로에
-그대로 적용되지 않는다. 반면 정확한 시뮬레이션 상태를 정책에 제공하는 점,
-고정된 모터·물리 설정, 센서 오차 모델과 실기 연결의 부재는 별도로 보완해야 한다.
-GPU 전환만으로 실제 Piper와의 동작 차이가 보정되는 것은 아니다.
+초기 비교의 CPU 물리 계산과 관측 정규화 관련 차이는 현재 기본 경로에
+그대로 적용되지 않는다. 현재 구성은 다음 표처럼 별도로 관리한다.
+
+## 현재 Piper 학습 구성
+
+기본 GPU 경로는 [Piper 학습 robustness 설정](piper_training_robustness.md)의
+값을 사용한다. 이 표는 현재 코드의 의도와 단위를 요약하며, Piper에서 직접
+측정한 식별 결과를 뜻하지 않는다.
+
+| 항목 | 현재 기본값 | 의미와 한계 |
+| --- | --- | --- |
+| 물리·정책 주기 | 물리 `0.002 s × 10`, 정책 50Hz | 초기 CPU 환경은 25Hz (`×20`)로 유지 |
+| 에피소드·안정 판정 | 600 정책 tick (12s), 16 tick (0.32s) | 정책 tick 기준이며 Warp 물리 substep은 별도 |
+| 행동 | 7차원 normalized direct target | 6개 관절 target은 joint-limit midpoint/half-span으로 decode하고 2mrad margin·tick별 slew를 적용 |
+| 관측 | 63차원: 56차원 raw-SI state + 7차원 previous raw action | actor는 sensor state 오차·지연 관측, critic은 같은 63차원의 clean 관측 |
+| 관측 정규화 | actor·critic empirical normalization | critic의 clean 입력은 학습용이며 실기 센서 경로를 뜻하지 않음 |
+| 물리 randomization | world별 episode마다 링크·cube 질량/관성/COM, table/cube/finger 마찰 | 보수적 불확실성 범위이며 Piper 측정값이 아님 |
+| 센서 randomization | 관절 영점 offset은 episode마다 고정, 균등 오차, 0–2 tick delay | 50Hz에서 0–40ms. command/current clock은 지연하지 않음 |
+| curriculum | vector-env tick `0/32k/64k/96k` | 성공률에 따른 자동 승급이 아니라 저장된 학습 step 경계 |
+| 모터 모델 | 기존 fixed gravcomp와 actuator 유지 | Piper BAM 또는 전압 randomization은 아직 추가하지 않음 |
+
+actor 관측에 접촉·상태 flag 등 시뮬레이터에서 계산한 값이 남아 있으므로,
+이 구성을 완전한 privileged-information 분리나 실기 배포 준비로 해석하면 안 된다.
+현재 task에는 IMU 입력이 없기 때문에 IMU 전용 noise도 넣지 않는다. 센서·물리
+범위는 실제 Piper 궤적과 대조해 조정해야 한다.
+
+구체적인 CLI toggle, stage 값, checkpoint 호환성은 [학습 robustness 문서](piper_training_robustness.md)를
+참조한다.
 
 근거: [현재 학습 설정](../scripts/train_piper_rsl.py),
 [현재 Warp 환경](../scripts/piper_warp_env.py), [실행 안내](../README.md).
@@ -58,8 +83,9 @@ GPU 전환만으로 실제 Piper와의 동작 차이가 보정되는 것은 아�
 - [레퍼런스 ONNX 내보내기](https://github.com/pollen-robotics/microduck_rl/blob/cb70b792312d559a4da09064d92009079671815f/src/mjlab_microduck/export.py)
 - [레퍼런스 실기·시뮬레이션 비교](https://github.com/pollen-robotics/microduck_rl/blob/cb70b792312d559a4da09064d92009079671815f/scripts/testbench_sim2real.py)
 
-Piper의 25Hz 제어와 손끝 목표를 IK로 관절 목표로 변환하는 구조는 작업에 따른
-설계 선택이다. 레퍼런스의 50Hz·관절 목표 출력과 똑같이 바꿀 필요는 없으며,
+초기 CPU Piper의 25Hz 제어와 손끝 목표를 IK로 관절 목표로 변환하는 구조는
+작업에 따른 설계 선택으로 보존한다. 현재 GPU 학습 경로는 50Hz·`0.002 s × 10`
+으로 조정했지만, 레퍼런스의 관절 목표 출력과 똑같이 만들었다는 뜻은 아니다.
 학습과 실제 제어의 주기·단위·좌표계·명령 처리 방식을 맞추는 것이 중요하다.
 
 현재 Piper 정책이 사용하는 물체 위치·자세·속도·접촉 정보는 실기에서도 측정하거나

@@ -1,0 +1,3 @@
+# Optional simulated RGB policy input.  The simulation/training base image
+# does not install the pretrained vision model unless this path is selected.
+timm==1.0.29

@@ -33,6 +33,8 @@ def build_model():
 
 class PiperPickPlaceEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
+    reward_version = 2
+    recontact_penalty = 0.2
     cube_half_size = 0.02
     goal_half_size = np.array([0.06, 0.05])
     frame_skip = 20
@@ -72,6 +74,21 @@ class PiperPickPlaceEnv(gym.Env):
             ids = np.flatnonzero((self.model.geom_bodyid == self.model.body(body).id)
                                  & (self.model.geom_contype != 0))
             self.finger_geoms.append(set(ids.tolist()))
+        # Include every collidable robot geom in the base_link subtree.  The
+        # cube, table and floor are task bodies outside that subtree, so an
+        # arm/link contact cannot be mistaken for a finger-only contact.
+        robot_root = int(self.model.body("base_link").id)
+        robot_bodies = []
+        for body_id in range(self.model.nbody):
+            current = body_id
+            while current != 0:
+                if current == robot_root:
+                    robot_bodies.append(body_id)
+                    break
+                current = int(self.model.body_parentid[current])
+        self.robot_geoms = set(
+            np.flatnonzero(np.isin(self.model.geom_bodyid, robot_bodies)).tolist()
+        )
         # A slightly tilted downward approach stays within Piper's wrist limits.
         angle = 2.8
         self.target_rotation = np.array([
@@ -81,7 +98,7 @@ class PiperPickPlaceEnv(gym.Env):
         self._jacp = np.zeros((3, self.model.nv))
         self._jacr = np.zeros((3, self.model.nv))
         self.action_space = spaces.Box(-1.0, 1.0, (4,), dtype=np.float32)
-        self.observation_space = spaces.Box(-np.inf, np.inf, (58,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, (59,), dtype=np.float32)
         self.renderer = None
         self.camera = mujoco.MjvCamera()
         self.camera.lookat[:] = [0.28, 0, 0.13]
@@ -151,6 +168,9 @@ class PiperPickPlaceEnv(gym.Env):
         self.target_position = self.tcp_position
         self.episode_steps = 0
         self.has_lifted = False
+        self.has_placed = False
+        self.recontacted = False
+        self.recontact_penalty_total = 0.0
         self.stable_steps = 0
         self.last_ik_error = 0.0
         self._previous_potential = self._potential()
@@ -169,6 +189,21 @@ class PiperPickPlaceEnv(gym.Env):
                 for index, ids in enumerate(self.finger_geoms):
                     touched[index] |= other in ids
         return np.array(touched, dtype=bool)
+
+    def _robot_cube_contact(self):
+        """Whether any collidable robot geom contacts the task cube."""
+        for contact in self.data.contact:
+            if contact.dist > 0.001:
+                continue
+            if contact.geom1 == self.cube_geom:
+                other = int(contact.geom2)
+            elif contact.geom2 == self.cube_geom:
+                other = int(contact.geom1)
+            else:
+                continue
+            if other in self.robot_geoms:
+                return True
+        return False
 
     def _placement_state(self):
         cube = self.cube_position
@@ -201,12 +236,16 @@ class PiperPickPlaceEnv(gym.Env):
             "is_success": bool(self.stable_steps >= self.settle_steps),
             "is_grasped": bool(self._finger_contacts().all()),
             "has_lifted": bool(self.has_lifted),
+            "has_placed": bool(self.has_placed),
             "inside_goal": inside,
             "released": released,
             "on_table": on_table,
             "object_still": still,
             "goal_distance": float(np.linalg.norm(self.cube_position[:2] - self.goal_position[:2])),
             "ik_error": self.last_ik_error,
+            "recontacted": bool(self.recontacted),
+            "recontact_penalty": float(self.recontact_penalty_total),
+            "reward_version": self.reward_version,
         }
 
     def _observation(self):
@@ -225,6 +264,7 @@ class PiperPickPlaceEnv(gym.Env):
             [float(self.has_lifted), self.stable_steps / self.settle_steps,
              self.episode_steps / self.max_episode_steps],
             self.data.ctrl[self.arm_actuators],
+            [float(self.has_placed)],
         ])
         return obs.astype(np.float32)
 
@@ -251,6 +291,17 @@ class PiperPickPlaceEnv(gym.Env):
         if self._finger_contacts().all() and self.cube_position[2] > self.cube_half_size + 0.05:
             self.has_lifted = True
         inside, on_table, still, released = self._placement_state()
+        robot_contact = self._robot_cube_contact()
+        was_placed = self.has_placed
+        recontact = was_placed and robot_contact
+        # Charge a contact only when the previous control step had already
+        # latched a valid release.  The latch therefore cannot penalize the
+        # ordinary approach, grasp, lift, transport, or descent phases.
+        if recontact:
+            self.recontacted = True
+            self.recontact_penalty_total += self.recontact_penalty
+        release_gate = self.has_lifted and inside and on_table and released and not robot_contact
+        self.has_placed = self.has_placed or release_gate
         valid_place = self.has_lifted and inside and on_table and still and released
         self.stable_steps = self.stable_steps + 1 if valid_place else 0
         success = self.stable_steps >= self.settle_steps
@@ -260,6 +311,7 @@ class PiperPickPlaceEnv(gym.Env):
             potential = 0.0  # Absorbing terminal state in potential-based shaping.
         reward = self.shaping_gamma * potential - self._previous_potential
         reward += -0.01 - 0.001 * float(np.square(action).sum()) + 20.0 * success - 5.0 * failed
+        reward -= self.recontact_penalty * float(recontact)
         self._previous_potential = potential
         terminated = bool(success or failed)
         truncated = bool(self.episode_steps >= self.max_episode_steps and not terminated)

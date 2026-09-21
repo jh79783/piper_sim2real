@@ -18,6 +18,8 @@ import warnings
 
 import numpy as np
 
+from scripts.piper_training_config import PiperTrainingConfig
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -35,42 +37,112 @@ class PiperWarpEnv:
     seed:
         Seed for deterministic cube/goal layout sampling.
     start_mode:
-        ``above_cube`` starts each TCP over its cube; ``home`` starts at the
-        fixed reachable home TCP pose.
+        ``curriculum`` samples above-cube/home starts from the current stage;
+        ``above_cube`` and ``home`` force one reset pose for every world.
     """
 
-    num_actions = 4
-    num_observations = 58
-    max_episode_length = 300
-    frame_skip = 20
-    action_scale = 0.01
-    gripper_scale = 0.008
-    settle_steps = 8
-    shaping_gamma = 0.99
+    # The actor emits six normalized absolute arm targets and one normalized
+    # gripper opening target.  The policy no longer runs Cartesian IK inside a
+    # rollout step; CPU IK is used only to construct reset states.
+    num_actions = 7
+    # Reward-v2's placement latch is retained, followed by the previous raw
+    # action.  The latter keeps the action-rate term Markov under slew limits.
+    num_observations = 63
+    reward_version = 2
+    recontact_penalty = 0.2
+    physics_timestep = 0.002
+    control_hz = 50
+    frame_skip = 10
+    max_episode_length = 600
+    gripper_scale = 0.004
+    joint_target_rate = 0.035
+    settle_steps = 16
+    shaping_gamma = float(np.sqrt(0.99))
+    time_penalty = 0.005
     cube_half_size = 0.02
-    workspace_low = np.array([0.24, -0.18, 0.025], dtype=np.float32)
-    workspace_high = np.array([0.43, 0.18, 0.15], dtype=np.float32)
     goal_half_size_np = np.array([0.06, 0.05], dtype=np.float32)
-    target_rotation_np = np.array(
-        [
-            [np.cos(2.8), 0.0, np.sin(2.8)],
-            [0.0, 1.0, 0.0],
-            [-np.sin(2.8), 0.0, np.cos(2.8)],
-        ],
-        dtype=np.float32,
+
+    # Named slices are part of the environment API.  They keep actor sensor
+    # history and downstream callers aligned when fields are rearranged.
+    OBS_ARM_Q = slice(0, 6)
+    OBS_ARM_DQ = slice(6, 12)
+    OBS_FINGER_Q = slice(12, 14)
+    OBS_GRIPPER_TARGET = slice(14, 15)
+    OBS_FINGER_DQ = slice(15, 17)
+    OBS_TCP = slice(17, 20)
+    OBS_CUBE = slice(20, 23)
+    OBS_CUBE_QUAT = slice(23, 27)
+    OBS_CUBE_DQ = slice(27, 33)
+    OBS_CUBE_TCP = slice(33, 36)
+    OBS_GOAL = slice(36, 39)
+    OBS_GOAL_CUBE = slice(39, 42)
+    OBS_GOAL_HALF = slice(42, 44)
+    OBS_CONTACTS = slice(44, 46)
+    OBS_LIFTED = slice(46, 47)
+    OBS_STABLE = slice(47, 48)
+    OBS_TIME = slice(48, 49)
+    OBS_ARM_CTRL = slice(49, 55)
+    OBS_PLACED = slice(55, 56)
+    OBS_PREVIOUS_ACTION = slice(56, 63)
+    # Sensor columns are delayed/noised for the actor.  Commands, goals and
+    # progress time are overlaid from the current world on every read.
+    SENSOR_OBS_SLICES = (
+        OBS_ARM_Q,
+        OBS_ARM_DQ,
+        OBS_FINGER_Q,
+        OBS_FINGER_DQ,
+        OBS_TCP,
+        OBS_CUBE,
+        OBS_CUBE_QUAT,
+        OBS_CUBE_DQ,
+        OBS_CUBE_TCP,
+        OBS_CONTACTS,
+        OBS_LIFTED,
+        OBS_STABLE,
+        OBS_PLACED,
     )
+    CURRENT_OBS_SLICES = (
+        OBS_GRIPPER_TARGET,
+        OBS_GOAL,
+        OBS_GOAL_HALF,
+        OBS_TIME,
+        OBS_ARM_CTRL,
+        OBS_PREVIOUS_ACTION,
+    )
+    # This field uses the current command goal and the delayed/noisy cube;
+    # callers should verify it against those two columns rather than compare
+    # it to the clean critic's goal-minus-cube value.
+    DERIVED_CURRENT_OBS_SLICES = (OBS_GOAL_CUBE,)
 
     def __init__(
         self,
         num_envs: int = 128,
         device: str = "cuda",
         seed: int = 0,
-        start_mode: str = "above_cube",
+        start_mode: str = "curriculum",
+        training_config: PiperTrainingConfig | dict | None = None,
     ) -> None:
         if int(num_envs) < 1:
             raise ValueError("num_envs must be positive")
-        if start_mode not in ("above_cube", "home"):
-            raise ValueError("start_mode must be above_cube or home")
+        if start_mode not in ("curriculum", "above_cube", "home"):
+            raise ValueError("start_mode must be curriculum, above_cube, or home")
+        if training_config is None:
+            training_config = PiperTrainingConfig()
+        elif isinstance(training_config, dict):
+            training_config = PiperTrainingConfig.from_dict(training_config)
+        if not isinstance(training_config, PiperTrainingConfig):
+            raise TypeError("training_config must be PiperTrainingConfig or a mapping")
+        self.training_config = training_config
+        # Copy timing/control values from the serializable config so a
+        # restored run and a fresh run execute the same contract.
+        self.physics_timestep = float(self.training_config.physics_timestep)
+        self.control_hz = int(self.training_config.control_hz)
+        self.frame_skip = int(self.training_config.decimation)
+        self.max_episode_length = int(self.training_config.episode_steps)
+        self.settle_steps = int(self.training_config.success_steps)
+        self.joint_target_rate = float(self.training_config.joint_target_rate)
+        self.gripper_scale = float(self.training_config.gripper_target_rate)
+        self.time_penalty = float(self.training_config.time_penalty)
         if not str(device).startswith("cuda"):
             raise ValueError("PiperWarpEnv requires an explicit CUDA device")
 
@@ -101,7 +173,13 @@ class PiperWarpEnv:
         torch_device = self.device
         warp_device = str(torch_device)
         torch.cuda.set_device(torch_device)
+        # Keep reset randomization independent of Torch's global policy RNG.
+        self._torch_rng = torch.Generator(device=warp_device)
+        self._torch_rng.manual_seed(int(seed))
         self.start_mode = start_mode
+        self._manual_start_mode = start_mode if start_mode != "curriculum" else None
+        self.training_steps = 0
+        self._stage = self.training_config.stage_at(self.training_steps)
         self._rng = np.random.default_rng(seed)
         self.seed_value = int(seed)
 
@@ -110,7 +188,10 @@ class PiperWarpEnv:
         from scripts.piper_pick_place_env import PiperPickPlaceEnv, build_model
 
         self.model = build_model()
-        self._ik_env = PiperPickPlaceEnv(start_mode=start_mode)
+        # The CPU helper only supplies reset-time IK.  It does not participate
+        # in GPU rollout stepping and must receive one of its two concrete
+        # reset modes even when the GPU env uses curriculum starts.
+        self._ik_env = PiperPickPlaceEnv(start_mode="above_cube")
         self._ik_home = np.array([0.0, 1.57, -1.3485, 0.0, 0.0, 0.0], dtype=np.float64)
         # Use Warp's native blocking stream: unlike a wrapped Torch stream it
         # supports CUDA graph capture in Warp 1.12.  It is a distinct CUDA
@@ -124,16 +205,34 @@ class PiperWarpEnv:
             "num_envs": self.num_envs,
             "num_obs": self.num_observations,
             "num_actions": self.num_actions,
+            "action_semantics": "absolute_joint_targets_v1",
+            "action_contract": "raw_si_direct_joint_v1",
+            "observation_version": "policy_critic_sensor_history_v1",
             "decimation": self.frame_skip,
             "episode_length": self.max_episode_length,
+            "physics_timestep": self.physics_timestep,
+            "control_hz": self.control_hz,
+            "control_period": 1.0 / self.control_hz,
+            "episode_seconds": self.max_episode_length / self.control_hz,
+            "success_steps": self.settle_steps,
+            "success_seconds": self.settle_steps / self.control_hz,
+            "shaping_gamma": self.shaping_gamma,
+            "joint_target_rate": self.joint_target_rate,
+            "gripper_target_rate": self.gripper_scale,
+            "time_penalty": self.time_penalty,
+            "reward_version": self.reward_version,
+            "recontact_penalty": self.recontact_penalty,
+            "training_config": self.training_config.to_dict(),
+            "training_steps": self.training_steps,
+            "curriculum_stage": self._stage_at_runtime(),
         }
 
         self.tcp_id = int(self.model.site("grasp_tcp").id)
         self.cube_geom = int(self.model.geom("cube_geom").id)
+        self.table_geom = int(self.model.geom("table").id)
         self.cube_body = int(self.model.body("cube").id)
         self.goal_body = int(self.model.body("goal_area").id)
         self.goal_mocap_id = int(self.model.body_mocapid[self.goal_body])
-        self.link6_body = int(self.model.body("link6").id)
         self.cube_qadr = int(self.model.jnt_qposadr[self.model.joint("cube_free").id])
         self.cube_vadr = int(self.model.jnt_dofadr[self.model.joint("cube_free").id])
         self.arm_qadr = np.asarray(
@@ -156,6 +255,23 @@ class PiperWarpEnv:
             ],
             dtype=np.float32,
         )
+        self._moving_body_ids_np = np.asarray(
+            [self.model.body(f"link{i}").id for i in range(1, 9)] + [self.cube_body],
+            dtype=np.int64,
+        )
+        self._finger_geom_ids_np = np.flatnonzero(
+            np.isin(self.model.geom_bodyid, [
+                int(self.model.body("link7").id),
+                int(self.model.body("link8").id),
+            ])
+            & (self.model.geom_contype != 0)
+        ).astype(np.int64)
+        self._friction_geom_ids_np = np.unique(
+            np.concatenate((
+                np.asarray([self.table_geom, self.cube_geom], dtype=np.int64),
+                self._finger_geom_ids_np,
+            ))
+        )
 
         # Immutable index tensors keep all per-step gathers on CUDA.
         self._arm_qadr = torch.as_tensor(self.arm_qadr, dtype=torch.long, device=torch_device)
@@ -163,10 +279,11 @@ class PiperWarpEnv:
         self._arm_actuators = torch.as_tensor(self.arm_actuators, dtype=torch.long, device=torch_device)
         self._joint_low = torch.as_tensor(self.joint_ranges[:, 0], device=torch_device)
         self._joint_high = torch.as_tensor(self.joint_ranges[:, 1], device=torch_device)
+        self._joint_mid = 0.5 * (self._joint_low + self._joint_high)
+        self._joint_half_range = 0.5 * (self._joint_high - self._joint_low)
+        self._action_target_low = self._joint_low + 0.002
+        self._action_target_high = self._joint_high - 0.002
         self._goal_half_size = torch.as_tensor(self.goal_half_size_np, device=torch_device)
-        self._target_rotation = torch.as_tensor(self.target_rotation_np, device=torch_device)
-        self._workspace_low = torch.as_tensor(self.workspace_low, device=torch_device)
-        self._workspace_high = torch.as_tensor(self.workspace_high, device=torch_device)
         self._all_worlds = torch.arange(self.num_envs, dtype=torch.long, device=torch_device)
         self._contact_indices = torch.arange(0, 0, dtype=torch.long, device=torch_device)
         self._arm_ctrl = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=torch_device)
@@ -184,6 +301,10 @@ class PiperWarpEnv:
                 njmax=1024,
                 njmax_nnz=1024 * self.model.nv,
             )
+            # MuJoCo-Warp initially stores world-varying model fields with a
+            # single leading row.  Expand them before any reset or CUDA graph
+            # capture and retain the allocations for the environment lifetime.
+            self._expand_world_model_fields()
 
         self._qpos = wp.to_torch(self._warp_data.qpos)
         self._qvel = wp.to_torch(self._warp_data.qvel)
@@ -197,6 +318,7 @@ class PiperWarpEnv:
         self._contact_worldid = wp.to_torch(self._warp_data.contact.worldid)
         self._contact_dist = wp.to_torch(self._warp_data.contact.dist)
         self._mocap_pos = wp.to_torch(self._warp_data.mocap_pos)
+        self._bind_model_parameter_views()
         self._finger_geom_tensors = []
         for body_name in ("link7", "link8"):
             body_id = int(self.model.body(body_name).id)
@@ -210,18 +332,57 @@ class PiperWarpEnv:
                     device=torch_device,
                 )
             )
+        # Keep all collidable robot geometry in the base_link subtree.  This
+        # includes arm links and both fingers while excluding task geometry
+        # (table/floor/cube/goal), so recontact is not finger-only.
+        robot_root = int(self.model.body("base_link").id)
+        robot_bodies = []
+        for body_id in range(self.model.nbody):
+            current = body_id
+            while current != 0:
+                if current == robot_root:
+                    robot_bodies.append(body_id)
+                    break
+                current = int(self.model.body_parentid[current])
+        robot_geom_ids = np.flatnonzero(np.isin(self.model.geom_bodyid, robot_bodies))
+        self._robot_geom_tensor = torch.as_tensor(
+            robot_geom_ids, dtype=torch.long, device=torch_device
+        )
 
         self.goal_xy = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=torch_device)
         self.goal_position = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=torch_device)
-        self.target_position = torch.zeros((self.num_envs, 3), dtype=torch.float32, device=torch_device)
         self.gripper_target = torch.full((self.num_envs,), 0.035, dtype=torch.float32, device=torch_device)
         self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.int32, device=torch_device)
         self.has_lifted = torch.zeros(self.num_envs, dtype=torch.bool, device=torch_device)
+        self.has_placed = torch.zeros(self.num_envs, dtype=torch.bool, device=torch_device)
+        self.recontacted = torch.zeros(self.num_envs, dtype=torch.bool, device=torch_device)
+        self.recontact_penalty_total = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=torch_device
+        )
         self.stable_steps = torch.zeros(self.num_envs, dtype=torch.int32, device=torch_device)
         self.last_ik_error = torch.zeros(self.num_envs, dtype=torch.float32, device=torch_device)
         self._previous_potential = torch.zeros(self.num_envs, dtype=torch.float32, device=torch_device)
         self._last_success = torch.zeros(self.num_envs, dtype=torch.bool, device=torch_device)
         self._last_actions = torch.zeros((self.num_envs, self.num_actions), dtype=torch.float32, device=torch_device)
+        self._last_action_delta = torch.zeros_like(self._last_actions)
+        self._joint_zero_offset = torch.zeros((self.num_envs, 6), dtype=torch.float32, device=torch_device)
+        self._start_home = torch.zeros(self.num_envs, dtype=torch.bool, device=torch_device)
+        self._sensor_delay = torch.zeros(self.num_envs, dtype=torch.long, device=torch_device)
+        self._sensor_history = torch.zeros(
+            (self.num_envs, self.training_config.max_sensor_delay_steps + 1, self.num_observations),
+            dtype=torch.float32,
+            device=torch_device,
+        )
+        self._episode_mass_scale = torch.ones(
+            (self.num_envs, len(self._moving_body_ids_np)), dtype=torch.float32, device=torch_device
+        )
+        self._episode_inertia_scale = torch.ones_like(self._episode_mass_scale)
+        self._episode_com_offset = torch.zeros(
+            (self.num_envs, len(self._moving_body_ids_np), 3), dtype=torch.float32, device=torch_device
+        )
+        self._episode_friction_scale = torch.ones(
+            (self.num_envs, len(self._friction_geom_ids_np)), dtype=torch.float32, device=torch_device
+        )
         self._step_graph = None
         self._step_graph_attempted = False
         self._step_graph_error = None
@@ -258,14 +419,224 @@ class PiperWarpEnv:
                 # subsequent Torch cleanup cannot race the device stream.
                 torch_stream.wait_stream(self._torch_warp_stream)
 
+    # These fields are the world-varying arrays consumed by MuJoCo-Warp's
+    # dynamics and by ``set_const``.  Other model arrays are immutable topology
+    # or geometry data and intentionally remain one-row/shared.
+    _WORLD_MODEL_FIELDS = (
+        "body_mass",
+        "body_inertia",
+        "body_ipos",
+        "geom_friction",
+        "body_subtreemass",
+        "body_invweight0",
+        "dof_invweight0",
+        "tendon_length0",
+        "tendon_invweight0",
+        "cam_pos0",
+        "cam_poscom0",
+        "cam_mat0",
+        "light_pos0",
+        "light_poscom0",
+        "light_dir0",
+        "actuator_acc0",
+        "actuator_biasprm",
+    )
+
+    def _expand_world_model_fields(self):
+        """Expand MuJoCo-Warp's leading singleton rows before graph capture."""
+
+        torch = self._torch
+        wp = self._wp
+        self._expanded_model_fields = {}
+
+        def expand(owner, name):
+            field = getattr(owner, name, None)
+            if field is None or not hasattr(field, "shape"):
+                return
+            shape = tuple(field.shape)
+            if not shape or shape[0] != 1 or self.num_envs == 1:
+                return
+            value = wp.to_torch(field)
+            repeat = (self.num_envs,) + (1,) * (value.ndim - 1)
+            expanded = value.repeat(repeat)
+            replacement = wp.from_torch(
+                expanded,
+                dtype=field.dtype,
+                requires_grad=False,
+            )
+            setattr(owner, name, replacement)
+            self._expanded_model_fields[name] = replacement
+
+        for name in self._WORLD_MODEL_FIELDS:
+            expand(self._warp_model, name)
+        # ``meaninertia`` is nested under Model.stat rather than Model itself.
+        expand(self._warp_model.stat, "meaninertia")
+
+    def _bind_model_parameter_views(self):
+        """Cache CUDA views and immutable CPU baselines for reset randomization."""
+
+        torch = self._torch
+        wp = self._wp
+        self._warp_body_mass = wp.to_torch(self._warp_model.body_mass)
+        self._warp_body_inertia = wp.to_torch(self._warp_model.body_inertia)
+        self._warp_body_ipos = wp.to_torch(self._warp_model.body_ipos)
+        self._warp_geom_friction = wp.to_torch(self._warp_model.geom_friction)
+        self._base_body_mass = torch.as_tensor(
+            self.model.body_mass,
+            dtype=self._warp_body_mass.dtype,
+            device=self.device,
+        ).clone()
+        self._base_body_inertia = torch.as_tensor(
+            self.model.body_inertia,
+            dtype=self._warp_body_inertia.dtype,
+            device=self.device,
+        ).clone()
+        self._base_body_ipos = torch.as_tensor(
+            self.model.body_ipos,
+            dtype=self._warp_body_ipos.dtype,
+            device=self.device,
+        ).clone()
+        self._base_geom_friction = torch.as_tensor(
+            self.model.geom_friction,
+            dtype=self._warp_geom_friction.dtype,
+            device=self.device,
+        ).clone()
+        # Public aliases make the per-world fields easy to inspect without
+        # copying them back to CPU.  They remain stable for the env lifetime.
+        self.body_mass = self._warp_body_mass
+        self.body_inertia = self._warp_body_inertia
+        self.body_ipos = self._warp_body_ipos
+        self.geom_friction = self._warp_geom_friction
+
+    def _stage_at_runtime(self):
+        stage = self._stage
+        return {
+            "step": int(stage.step),
+            "randomization_scale": float(stage.randomization_scale),
+            "layout_scale": float(stage.layout_scale),
+            "home_probability": float(stage.home_probability),
+            "action_rate_weight": float(stage.action_rate_weight),
+        }
+
+    @property
+    def curriculum_stage(self):
+        return self._stage_at_runtime()
+
+    def set_training_steps(self, count: int):
+        """Restore/update cumulative vector-env steps for curriculum lookup."""
+
+        count = int(count)
+        if count < 0:
+            raise ValueError("training step count must be nonnegative")
+        self.training_steps = count
+        self._stage = self.training_config.stage_at(count)
+        if hasattr(self, "cfg"):
+            self.cfg["training_steps"] = self.training_steps
+            self.cfg["curriculum_stage"] = self._stage_at_runtime()
+        return self._stage_at_runtime()
+
+    def _set_episode_randomization(self, worlds, stage):
+        """Write fresh per-world mass/inertia/CoM/friction values on reset."""
+
+        torch = self._torch
+        count = int(worlds.numel())
+        scale = float(stage.randomization_scale) if self.training_config.domain_randomization else 0.0
+        body_ids = torch.as_tensor(self._moving_body_ids_np, dtype=torch.long, device=self.device)
+        link_count = len(self._moving_body_ids_np) - 1
+        # One factor per body keeps each inertia diagonal a valid uniformly
+        # scaled tensor and prevents invalid triangle inequalities.
+        mass_fraction = torch.full((count, link_count + 1), self.training_config.link_mass_fraction,
+                                   device=self.device, dtype=self._warp_body_mass.dtype)
+        mass_fraction[:, -1] = self.training_config.cube_mass_fraction
+        mass_scale = 1.0 + (
+            2.0 * torch.rand(
+                mass_fraction.shape, device=self.device, dtype=mass_fraction.dtype,
+                generator=self._torch_rng,
+            ) - 1.0
+        ) * mass_fraction * scale
+        inertia_scale = 1.0 + (
+            2.0 * torch.rand(
+                mass_fraction.shape, device=self.device, dtype=mass_fraction.dtype,
+                generator=self._torch_rng,
+            ) - 1.0
+        ) * self.training_config.inertia_fraction * scale
+        com_range = torch.full((count, link_count + 1, 3), self.training_config.link_com_range,
+                               device=self.device, dtype=self._warp_body_ipos.dtype)
+        com_range[:, -1] = self.training_config.cube_com_range
+        com_offset = (
+            2.0 * torch.rand(
+                com_range.shape, device=self.device, dtype=com_range.dtype,
+                generator=self._torch_rng,
+            ) - 1.0
+        ) * com_range * scale
+
+        # Restore each selected world from immutable baselines before applying
+        # fresh factors.  This prevents reset-to-reset multiplicative drift.
+        for column, body_id in enumerate(body_ids.tolist()):
+            self._warp_body_mass[worlds, body_id] = self._base_body_mass[body_id] * mass_scale[:, column]
+            self._warp_body_inertia[worlds, body_id] = (
+                self._base_body_inertia[body_id] * inertia_scale[:, column, None]
+            )
+            self._warp_body_ipos[worlds, body_id] = self._base_body_ipos[body_id] + com_offset[:, column]
+
+        geom_ids = torch.as_tensor(self._friction_geom_ids_np, dtype=torch.long, device=self.device)
+        friction_base = self._base_geom_friction[geom_ids]
+        friction_fraction = self.training_config.friction_fraction
+        friction_scale = 1.0 + (
+            2.0 * torch.rand(
+                (count, geom_ids.numel()), device=self.device,
+                dtype=self._warp_geom_friction.dtype, generator=self._torch_rng,
+            ) - 1.0
+        ) * friction_fraction * scale
+        for column, geom_id in enumerate(geom_ids.tolist()):
+            self._warp_geom_friction[worlds, geom_id] = friction_base[column] * friction_scale[:, column, None]
+
+        self._episode_mass_scale[worlds] = mass_scale
+        self._episode_inertia_scale[worlds] = inertia_scale
+        self._episode_com_offset[worlds] = com_offset
+        self._episode_friction_scale[worlds] = friction_scale
+
+    def _reset_sensor_history(self, worlds, clean_observation):
+        """Reset delay buffers for selected worlds without sampling on reads."""
+
+        if worlds.numel() == 0:
+            return
+        # History is [world, delay slot, observation].  Slot zero is newest;
+        # reset fills every slot so a delayed sensor never leaks a prior
+        # episode.  Clones keep returned TensorDict transitions independent.
+        self._sensor_history[worlds] = clean_observation[worlds].unsqueeze(1).repeat(
+            1, self._sensor_history.shape[1], 1
+        )
+        self._sensor_delay[worlds] = 0
+
+    def _random_sensor_delay(self, worlds):
+        torch = self._torch
+        if worlds.numel() == 0:
+            return
+        if not self.training_config.sensor_noise:
+            self._sensor_delay[worlds] = 0
+            return
+        maximum = int(self.training_config.max_sensor_delay_steps)
+        if maximum:
+            self._sensor_delay[worlds] = torch.randint(
+                0,
+                maximum + 1,
+                (worlds.numel(),),
+                device=self.device,
+                dtype=torch.long,
+                generator=self._torch_rng,
+            )
+        else:
+            self._sensor_delay[worlds] = 0
+
     def _capture_step_graph(self) -> None:
-        """Capture the fixed 20-physics-step decimation on Warp's native stream.
+        """Capture the fixed 10-physics-step decimation on Warp's native stream.
 
         MJWarp's state/control arrays are stable for the lifetime of an env,
         so graph replay observes the latest CUDA-written ``data.ctrl`` and
         advances the current qpos/qvel in place.  If a future Warp/MuJoCo
         build rejects capture for a model feature, the backend keeps the same
-        GPU physics path and falls back to the ordinary 20-call loop while
+        GPU physics path and falls back to the ordinary 10-call loop while
         retaining the diagnostic in ``cfg``.
         """
 
@@ -309,28 +680,48 @@ class PiperWarpEnv:
                 for _ in range(self.frame_skip):
                     self._mjw.step(self._warp_model, self._warp_data)
 
-    def _sample_layout(self, count: int) -> tuple[np.ndarray, np.ndarray]:
-        cube = self._rng.uniform([0.28, -0.14], [0.40, 0.14], size=(count, 2)).astype(np.float32)
-        goal = self._rng.uniform([0.28, -0.14], [0.40, 0.14], size=(count, 2)).astype(np.float32)
+    def _sample_layout(self, count: int, stage=None) -> tuple[np.ndarray, np.ndarray]:
+        stage = self._stage if stage is None else stage
+        # The final table region is wider than the original 120 mm x-span,
+        # while the first curriculum stage remains easy and always admits the
+        # required 130 mm cube/goal separation.
+        center = np.array([0.34, 0.0], dtype=np.float32)
+        layout_scale = float(stage.layout_scale)
+        half_extent = np.array([0.09, 0.18], dtype=np.float32) * layout_scale
+        # Keep the exclusion region proportional to the curriculum layout so
+        # the compact first stage remains sampleable for central cube points.
+        min_separation = 0.13 * layout_scale
+        low = center - half_extent
+        high = center + half_extent
+        cube = self._rng.uniform(low, high, size=(count, 2)).astype(np.float32)
+        goal = self._rng.uniform(low, high, size=(count, 2)).astype(np.float32)
         pending = np.ones(count, dtype=bool)
-        for _ in range(1000):
-            pending = np.linalg.norm(goal - cube, axis=1) <= 0.13
+        for _ in range(10_000):
             if not pending.any():
                 return cube, goal
-            goal[pending] = self._rng.uniform(
-                [0.28, -0.14], [0.40, 0.14], size=(int(pending.sum()), 2)
+            candidates = self._rng.uniform(
+                low, high, size=(int(pending.sum()), 2)
             ).astype(np.float32)
+            goal[pending] = candidates
+            pending[pending] = np.linalg.norm(candidates - cube[pending], axis=1) <= min_separation
+        if not pending.any():
+            return cube, goal
         raise RuntimeError("could not sample separated cube and goal positions")
 
-    def _solve_initial_joints(self, cube_xy: np.ndarray) -> np.ndarray:
-        if self.start_mode == "home":
-            target = np.array([0.33, 0.0, 0.14], dtype=np.float64)
-            joints, residual = self._ik_env.solve_ik(target, self._ik_home, iterations=150)
-            if residual > 0.005:
-                raise RuntimeError(f"home IK failed with residual {residual:.4f} m")
-            return np.repeat(joints[None, :], cube_xy.shape[0], axis=0).astype(np.float32)
+    def _solve_initial_joints(self, cube_xy: np.ndarray, start_home: np.ndarray) -> np.ndarray:
+        home_joints = None
         joints = np.empty((cube_xy.shape[0], 6), dtype=np.float32)
-        for row, xy in zip(joints, cube_xy):
+        for row, xy, is_home in zip(joints, cube_xy, start_home):
+            if is_home:
+                if home_joints is None:
+                    target = np.array([0.33, 0.0, 0.14], dtype=np.float64)
+                    home_joints, residual = self._ik_env.solve_ik(
+                        target, self._ik_home, iterations=150
+                    )
+                    if residual > 0.005:
+                        raise RuntimeError(f"home IK failed with residual {residual:.4f} m")
+                row[:] = home_joints
+                continue
             target = np.array([float(xy[0]), float(xy[1]), 0.10], dtype=np.float64)
             solved, residual = self._ik_env.solve_ik(target, self._ik_home, iterations=150)
             if residual > 0.005:
@@ -345,12 +736,35 @@ class PiperWarpEnv:
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
             self.seed_value = int(seed)
+            self._torch_rng.manual_seed(int(seed))
         worlds = worlds.to(device=self.device, dtype=torch.long)
-        cube_xy_np, goal_xy_np = self._sample_layout(int(worlds.numel()))
-        joints_np = self._solve_initial_joints(cube_xy_np)
+        count = int(worlds.numel())
+        stage = self._stage
+        cube_xy_np, goal_xy_np = self._sample_layout(count, stage)
+        if self._manual_start_mode == "home":
+            start_home_np = np.ones(count, dtype=bool)
+        elif self._manual_start_mode == "above_cube":
+            start_home_np = np.zeros(count, dtype=bool)
+        else:
+            start_home_np = self._rng.random(count) < float(stage.home_probability)
+        joints_np = self._solve_initial_joints(cube_xy_np, start_home_np)
         cube_xy = torch.as_tensor(cube_xy_np, device=self.device)
         goal_xy = torch.as_tensor(goal_xy_np, device=self.device)
         joints = torch.as_tensor(joints_np, device=self.device)
+        start_home = torch.as_tensor(start_home_np, dtype=torch.bool, device=self.device)
+
+        # All physical and sensor episode parameters are selected once here.
+        # They remain fixed until this world is reset again.
+        self._set_episode_randomization(worlds, stage)
+        if self.training_config.sensor_noise:
+            self._joint_zero_offset[worlds] = (
+                2.0 * torch.rand(
+                    (count, 6), device=self.device, dtype=torch.float32, generator=self._torch_rng
+                ) - 1.0
+            ) * float(self.training_config.joint_zero_offset)
+        else:
+            self._joint_zero_offset[worlds] = 0.0
+        self._random_sensor_delay(worlds)
 
         reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         reset_mask[worlds] = True
@@ -386,29 +800,49 @@ class PiperWarpEnv:
             )
             # qpos/ctrl/mocap assignments above execute on Torch's current
             # stream even while Warp's stream is scoped.  Publish them before
-            # launching the dependent device-side forward pass.
+            # rebuilding constants and launching the dependent forward pass.
             self._torch_warp_stream.wait_stream(torch.cuda.current_stream(self.device))
+            # set_const temporarily copies qpos0 into qpos while recomputing
+            # mass/inertia-dependent constants, then restores current qpos.
+            # The explicit forward below refreshes all state-derived outputs.
+            self._mjw.set_const(self._warp_model, self._warp_data)
             self._mjw.forward(self._warp_model, self._warp_data)
 
         self.goal_xy[worlds] = goal_xy
         self.goal_position[worlds] = torch.cat(
             (goal_xy, torch.full((worlds.numel(), 1), self.cube_half_size, device=self.device)), dim=1
         )
-        if self.start_mode == "above_cube":
-            self.target_position[worlds] = torch.cat(
-                (cube_xy, torch.full((worlds.numel(), 1), 0.10, device=self.device)), dim=1
-            )
-        else:
-            self.target_position[worlds] = torch.tensor(
-                [0.33, 0.0, 0.14], device=self.device
-            )
         self.gripper_target[worlds] = 0.035
+        self._arm_ctrl[worlds] = joints
         self.episode_length_buf[worlds] = 0
         self.has_lifted[worlds] = False
+        self.has_placed[worlds] = False
+        self.recontacted[worlds] = False
+        self.recontact_penalty_total[worlds] = 0.0
         self.stable_steps[worlds] = 0
         self.last_ik_error[worlds] = 0.0
         self._last_success[worlds] = False
+        # Previous normalized commands are initialized to the reset targets,
+        # so holding the reset pose has zero action-rate penalty.
+        normalized_joints = torch.clamp(
+            (joints - self._joint_mid) / self._joint_half_range,
+            -1.0,
+            1.0,
+        )
+        self._last_actions[worlds] = torch.cat(
+            (normalized_joints, torch.ones((count, 1), device=self.device)), dim=1
+        )
         self._previous_potential[worlds] = self._potential()[worlds]
+        self._start_home[worlds] = start_home
+
+        # Build one actor frame at reset and fill every delay slot.  Calling
+        # get_observations repeatedly afterwards only clones these cached
+        # values; it never samples noise or advances history.
+        clean = self._observation_tensor()
+        actor = self._sensor_frame(clean, worlds)
+        self._sensor_history[worlds] = actor.unsqueeze(1).repeat(
+            1, self._sensor_history.shape[1], 1
+        )
 
     def reset(self, seed: int | None = None):
         """Reset all worlds and return a CUDA TensorDict observation."""
@@ -418,6 +852,7 @@ class PiperWarpEnv:
         if seed is not None:
             self._rng = np.random.default_rng(int(seed))
             self.seed_value = int(seed)
+            self._torch_rng.manual_seed(int(seed))
         self._reset_worlds(self._all_worlds, seed=None)
         return self.get_observations()
 
@@ -452,6 +887,24 @@ class PiperWarpEnv:
         result = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         result[:, 0].scatter_reduce_(0, world, touched7.to(torch.float32), reduce="amax", include_self=False)
         result[:, 1].scatter_reduce_(0, world, touched8.to(torch.float32), reduce="amax", include_self=False)
+        return result > 0.5
+
+    def _robot_cube_contacts(self) -> "object":
+        """Return per-world contact with any collidable robot geom and cube."""
+
+        torch = self._torch
+        nacon = self._nacon.reshape(-1)[0].to(dtype=torch.long)
+        slots = torch.arange(self._contact_geom.shape[0], device=self.device)
+        active = slots < nacon
+        world = self._contact_worldid.clamp(min=0, max=self.num_envs - 1).to(dtype=torch.long)
+        geom0 = self._contact_geom[:, 0]
+        geom1 = self._contact_geom[:, 1]
+        robot0 = torch.isin(geom0, self._robot_geom_tensor)
+        robot1 = torch.isin(geom1, self._robot_geom_tensor)
+        touched = active & (self._contact_dist <= 0.001)
+        touched &= ((geom0 == self.cube_geom) & robot1) | ((geom1 == self.cube_geom) & robot0)
+        result = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        result.scatter_reduce_(0, world, touched.to(torch.float32), reduce="amax", include_self=False)
         return result > 0.5
 
     def _check_physics_state(self) -> None:
@@ -506,79 +959,71 @@ class PiperWarpEnv:
         post = 4.0 + 2.0 * xy_score + 2.0 * place_score + release_score
         return torch.where(self.has_lifted, post, pre)
 
-    def _apply_cartesian_action(self, actions):
+    def _apply_joint_target_action(self, actions):
+        """Apply direct normalized absolute joint/gripper targets.
+
+        The policy action is mapped to the midpoint/half-range of the six arm
+        joint limits and to the physical 0--35 mm gripper opening.  The
+        actuator targets are slew-limited at the 50 Hz policy period; qpos is
+        changed only by MuJoCo-Warp integration.
+        """
+
         torch = self._torch
         actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
         if actions.shape != (self.num_envs, self.num_actions):
-            raise ValueError(f"actions must have shape ({self.num_envs}, 4), got {tuple(actions.shape)}")
+            raise ValueError(
+                f"actions must have shape ({self.num_envs}, {self.num_actions}), got {tuple(actions.shape)}"
+            )
         if not torch.isfinite(actions).all():
             raise FloatingPointError("non-finite CUDA action")
         actions = actions.clamp(-1.0, 1.0)
-        desired = torch.clamp(
-            self.target_position + self.action_scale * actions[:, :3],
-            self._workspace_low,
-            self._workspace_high,
+        previous_actions = self._last_actions.clone()
+        action_delta = actions - previous_actions
+
+        desired_joints = self._joint_mid + self._joint_half_range * actions[:, :6]
+        desired_joints = torch.clamp(
+            desired_joints, self._action_target_low, self._action_target_high
         )
-        point = self._site_xpos[:, self.tcp_id]
-        body = torch.full((self.num_envs,), self.link6_body, dtype=torch.int32, device=self.device)
-        jacp = self._wp.zeros((self.num_envs, 3, self.model.nv), dtype=self._wp.float32, device=str(self.device))
-        jacr = self._wp.zeros((self.num_envs, 3, self.model.nv), dtype=self._wp.float32, device=str(self.device))
-        with self._stream_scope():
-            self._mjw.jac(
-                self._warp_model,
-                self._warp_data,
-                jacp,
-                jacr,
-                self._wp.from_torch(point, dtype=self._wp.vec3, requires_grad=False),
-                self._wp.from_torch(body, dtype=self._wp.int32, requires_grad=False),
-            )
-        jacp_t = self._wp.to_torch(jacp)[:, :, self._arm_dofs]
-        jacr_t = self._wp.to_torch(jacr)[:, :, self._arm_dofs]
-        current_rotation = self._site_xmat[:, self.tcp_id]
-        rotation_error = 0.5 * torch.cross(
-            current_rotation.transpose(-1, -2),
-            self._target_rotation.expand(self.num_envs, -1, -1).transpose(-1, -2),
-            dim=-1,
-        ).sum(dim=-2)
-        error = torch.cat((desired - point, 0.3 * rotation_error), dim=1)
-        jac = torch.cat((jacp_t, 0.3 * jacr_t), dim=1)
-        eye = torch.eye(6, device=self.device).expand(self.num_envs, -1, -1)
-        lhs = jac @ jac.transpose(-1, -2) + 0.003**2 * eye
-        delta = jac.transpose(-1, -2) @ torch.linalg.solve(lhs, error.unsqueeze(-1))
-        delta = delta.squeeze(-1).clamp(-0.1, 0.1)
-        current = self._qpos[:, self._arm_qadr]
-        joints = torch.clamp(current + delta, self._joint_low + 0.002, self._joint_high - 0.002)
-        self.last_ik_error = torch.linalg.vector_norm(desired - point, dim=1)
-        self.target_position = desired
-        self.gripper_target = torch.clamp(
-            self.gripper_target + self.gripper_scale * actions[:, 3], 0.0, 0.035
+        previous_joints = self._ctrl[:, self._arm_actuators]
+        applied_joints = torch.maximum(
+            torch.minimum(desired_joints, previous_joints + self.joint_target_rate),
+            previous_joints - self.joint_target_rate,
         )
+        desired_gripper = 0.5 * 0.035 * (actions[:, 6] + 1.0)
+        previous_gripper = self._ctrl[:, self.gripper_actuator]
+        applied_gripper = torch.maximum(
+            torch.minimum(desired_gripper, previous_gripper + self.gripper_scale),
+            previous_gripper - self.gripper_scale,
+        ).clamp(0.0, 0.035)
         # Position actuator targets are the only command writes during step;
         # qpos changes below come exclusively from MuJoCo-Warp integration.
-        previous = self._ctrl[:, self._arm_actuators].clone()
-        self._arm_ctrl = torch.maximum(torch.minimum(joints, previous + 0.07), previous - 0.07)
-        self._ctrl[:, self._arm_actuators] = self._arm_ctrl
-        self._ctrl[:, self.gripper_actuator] = self.gripper_target
+        self._arm_ctrl = applied_joints
+        self._ctrl[:, self._arm_actuators] = applied_joints
+        self._ctrl[:, self.gripper_actuator] = applied_gripper
+        self.gripper_target = applied_gripper
         self._last_actions = actions
-        return actions
+        self._last_action_delta = action_delta
+        self.last_ik_error.zero_()
+        return actions, action_delta
 
     def _observation_tensor(self):
+        """Build the clean 56-field SI observation from current Warp state."""
+
         torch = self._torch
         finger = self._finger_contacts().to(torch.float32)
         cube = self._cube_position()
         tcp = self._tcp_position()
         pieces = (
             self._qpos[:, self._arm_qadr],
-            self._qvel[:, self._arm_dofs] * 0.1,
-            (self._qpos[:, self.finger_qadr] / 0.035).unsqueeze(1),
-            (self._qpos[:, self.other_finger_qadr] / 0.035).unsqueeze(1),
-            (self.gripper_target / 0.035).unsqueeze(1),
-            self._qvel[:, [self.finger_dofadr, self.other_finger_dofadr]] * 0.1,
+            self._qvel[:, self._arm_dofs],
+            self._qpos[:, self.finger_qadr].unsqueeze(1),
+            self._qpos[:, self.other_finger_qadr].unsqueeze(1),
+            self.gripper_target.unsqueeze(1),
+            self._qvel[:, [self.finger_dofadr, self.other_finger_dofadr]],
             tcp,
-            self.target_position,
             cube,
             self._qpos[:, self.cube_qadr + 3 : self.cube_qadr + 7],
-            self._qvel[:, self.cube_vadr : self.cube_vadr + 6] * 0.1,
+            self._qvel[:, self.cube_vadr : self.cube_vadr + 6],
             cube - tcp,
             self.goal_position,
             self.goal_position - cube,
@@ -588,19 +1033,132 @@ class PiperWarpEnv:
             (self.stable_steps.to(torch.float32) / self.settle_steps).unsqueeze(1),
             (self.episode_length_buf.to(torch.float32) / self.max_episode_length).unsqueeze(1),
             self._ctrl[:, self._arm_actuators],
+            self.has_placed.to(torch.float32).unsqueeze(1),
+            self._last_actions,
         )
         result = torch.cat(pieces, dim=1)
         if result.shape[-1] != self.num_observations:
-            raise RuntimeError(f"observation layout has {result.shape[-1]} fields, expected 58")
+            raise RuntimeError(
+                f"observation layout has {result.shape[-1]} fields, expected {self.num_observations}"
+            )
         if not torch.isfinite(result).all():
             raise FloatingPointError("MuJoCo-Warp produced non-finite observation")
         return result
 
+    def _uniform_sensor_noise(self, shape, bound, *, dtype):
+        torch = self._torch
+        if not self.training_config.sensor_noise or bound == 0.0:
+            return torch.zeros(shape, dtype=dtype, device=self.device)
+        return (2.0 * torch.rand(
+            shape, dtype=dtype, device=self.device, generator=self._torch_rng
+        ) - 1.0) * float(bound)
+
+    def _sensor_frame(self, clean, worlds):
+        """Sample one noisy sensor frame for selected worlds.
+
+        This method is called exactly once per reset and once per environment
+        transition.  ``get_observations`` only selects/copies cached frames.
+        Derived differences are reconstructed from the same noisy primary
+        vectors, so noise cannot create internally inconsistent geometry.
+        """
+
+        torch = self._torch
+        worlds = worlds.to(device=self.device, dtype=torch.long)
+        frame = clean[worlds].clone()
+        count = int(worlds.numel())
+        if count == 0:
+            return frame
+        if not self.training_config.sensor_noise:
+            return frame
+        arm_q = frame[:, self.OBS_ARM_Q]
+        arm_q += self._joint_zero_offset[worlds]
+        arm_q += self._uniform_sensor_noise(
+            arm_q.shape, self.training_config.joint_position_noise, dtype=arm_q.dtype
+        )
+        frame[:, self.OBS_ARM_DQ] += self._uniform_sensor_noise(
+            (count, 6), self.training_config.joint_velocity_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_FINGER_Q] += self._uniform_sensor_noise(
+            (count, 2), self.training_config.finger_position_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_FINGER_DQ] += self._uniform_sensor_noise(
+            (count, 2), self.training_config.finger_velocity_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_TCP] += self._uniform_sensor_noise(
+            (count, 3), self.training_config.position_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_CUBE] += self._uniform_sensor_noise(
+            (count, 3), self.training_config.position_noise, dtype=frame.dtype
+        )
+        # Apply a bounded axis-angle perturbation, then multiply and normalize
+        # so every noisy orientation remains a proper unit quaternion.
+        quat = frame[:, self.OBS_CUBE_QUAT]
+        angle = self._uniform_sensor_noise(
+            (count,), self.training_config.orientation_noise, dtype=frame.dtype
+        )
+        axis = 2.0 * torch.rand(
+            (count, 3), device=self.device, dtype=frame.dtype, generator=self._torch_rng
+        ) - 1.0
+        axis = axis / torch.linalg.vector_norm(axis, dim=1, keepdim=True).clamp_min(1e-8)
+        half = 0.5 * angle
+        delta_w = torch.cos(half)
+        delta_v = axis * torch.sin(half).unsqueeze(1)
+        qw, qv = quat[:, :1], quat[:, 1:]
+        dw, dv = delta_w.unsqueeze(1), delta_v
+        noisy_q = torch.cat(
+            (
+                qw * dw - (qv * dv).sum(dim=1, keepdim=True),
+                qw * dv + dw * qv + torch.cross(qv, dv, dim=1),
+            ),
+            dim=1,
+        )
+        frame[:, self.OBS_CUBE_QUAT] = noisy_q / torch.linalg.vector_norm(
+            noisy_q, dim=1, keepdim=True
+        ).clamp_min(1e-8)
+        frame[:, self.OBS_CUBE_DQ.start : self.OBS_CUBE_DQ.start + 3] += self._uniform_sensor_noise(
+            (count, 3), self.training_config.linear_velocity_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_CUBE_DQ.start + 3 : self.OBS_CUBE_DQ.stop] += self._uniform_sensor_noise(
+            (count, 3), self.training_config.angular_velocity_noise, dtype=frame.dtype
+        )
+        frame[:, self.OBS_CUBE_TCP] = (
+            frame[:, self.OBS_CUBE] - frame[:, self.OBS_TCP]
+        )
+        return frame
+
+    def _advance_sensor_history(self, clean):
+        if self._sensor_history.shape[1] > 1:
+            self._sensor_history[:, 1:] = self._sensor_history[:, :-1].clone()
+        self._sensor_history[:, 0] = self._sensor_frame(clean, self._all_worlds)
+
     def get_observations(self):
         from tensordict import TensorDict
 
-        obs = self._observation_tensor()
-        return TensorDict({"policy": obs}, batch_size=[self.num_envs], device=self.device)
+        torch = self._torch
+        clean = self._observation_tensor()
+        world_ids = self._all_worlds
+        policy = self._sensor_history[world_ids, self._sensor_delay].clone()
+        # Commands/goals/time are current even when physical sensor columns are
+        # delayed.  Goal-minus-cube is rebuilt from the delayed/noisy cube so
+        # it remains consistent without leaking a clean current cube to actor.
+        policy[:, self.OBS_GRIPPER_TARGET] = clean[:, self.OBS_GRIPPER_TARGET]
+        policy[:, self.OBS_GOAL] = clean[:, self.OBS_GOAL]
+        policy[:, self.OBS_GOAL_CUBE] = (
+            clean[:, self.OBS_GOAL] - policy[:, self.OBS_CUBE]
+        )
+        policy[:, self.OBS_GOAL_HALF] = clean[:, self.OBS_GOAL_HALF]
+        policy[:, self.OBS_TIME] = clean[:, self.OBS_TIME]
+        policy[:, self.OBS_ARM_CTRL] = clean[:, self.OBS_ARM_CTRL]
+        policy[:, self.OBS_PREVIOUS_ACTION] = clean[:, self.OBS_PREVIOUS_ACTION]
+        if not torch.isfinite(policy).all():
+            raise FloatingPointError("MuJoCo-Warp produced non-finite actor observation")
+        # Return independent clones: RSL-RL retains rollout references before
+        # the next transition and must never observe our cache being shifted.
+        return TensorDict(
+            {"policy": policy.clone(), "critic": clean.clone()},
+            batch_size=[self.num_envs],
+            device=self.device,
+        )
 
     def _extras(
         self,
@@ -613,6 +1171,10 @@ class PiperWarpEnv:
         still,
         terminal_has_lifted,
         terminal_goal_distance,
+        terminal_has_placed,
+        terminal_recontacted,
+        terminal_recontact_penalty,
+        recontact,
     ):
         torch = self._torch
         done = done.to(torch.bool)
@@ -623,15 +1185,21 @@ class PiperWarpEnv:
             "task/success_rate": success[completed].to(torch.float32),
             "task/lift_rate": terminal_has_lifted[completed].to(torch.float32),
             "task/final_goal_distance": terminal_goal_distance[completed],
+            "task/recontact_rate": terminal_recontacted[completed].to(torch.float32),
+            "task/recontact_penalty": terminal_recontact_penalty[completed],
         }
         extras = {
             "time_outs": timeout,
             "is_success": success,
             "has_lifted": terminal_has_lifted,
+            "has_placed": terminal_has_placed,
             "inside_goal": inside,
             "released": released,
             "on_table": on_table,
             "object_still": still,
+            "recontact": recontact,
+            "recontacted": terminal_recontacted,
+            "recontact_penalty": terminal_recontact_penalty,
             "done": done,
             "done_mask": done,
         }
@@ -640,12 +1208,13 @@ class PiperWarpEnv:
         return extras
 
     def step(self, actions):
-        """Apply batched actions, advance 20 Warp substeps, and auto-reset done worlds."""
+        """Apply direct targets, advance ten 2 ms Warp substeps, and reset done worlds."""
 
         if self._closed:
             raise RuntimeError("PiperWarpEnv is closed")
         torch = self._torch
-        actions = self._apply_cartesian_action(actions)
+        actions, action_delta = self._apply_joint_target_action(actions)
+        action_rate_weight = float(self._stage.action_rate_weight)
         self._step_physics()
         self._check_physics_state()
         self.episode_length_buf.add_(1)
@@ -654,6 +1223,13 @@ class PiperWarpEnv:
         cube = self._cube_position()
         self.has_lifted |= contacts.all(dim=1) & (cube[:, 2] > self.cube_half_size + 0.05)
         inside, on_table, still, released = self._placement_state()
+        robot_contact = self._robot_cube_contacts()
+        was_placed = self.has_placed.clone()
+        recontact = was_placed & robot_contact
+        self.recontacted |= recontact
+        self.recontact_penalty_total += self.recontact_penalty * recontact.to(torch.float32)
+        release_gate = self.has_lifted & inside & on_table & released & ~robot_contact
+        self.has_placed |= release_gate
         valid_place = self.has_lifted & inside & on_table & still & released
         self.stable_steps = torch.where(valid_place, self.stable_steps + 1, torch.zeros_like(self.stable_steps))
         success = self.stable_steps >= self.settle_steps
@@ -665,10 +1241,18 @@ class PiperWarpEnv:
         potential = self._potential()
         potential = torch.where(terminal, torch.zeros_like(potential), potential)
         rewards = self.shaping_gamma * potential - self._previous_potential
-        rewards = rewards - 0.01 - 0.001 * torch.square(actions).sum(dim=1)
+        rewards = rewards - self.time_penalty
+        # ``action_delta`` was captured before _last_actions was overwritten in
+        # _apply_joint_target_action, so this remains the intended transition
+        # penalty even under target slew saturation.
+        rewards = rewards - action_rate_weight * torch.square(action_delta).sum(dim=1)
         rewards = rewards + 20.0 * success.to(torch.float32) - 5.0 * failed.to(torch.float32)
+        rewards = rewards - self.recontact_penalty * recontact.to(torch.float32)
         self._previous_potential = potential
         terminal_has_lifted = self.has_lifted.clone()
+        terminal_has_placed = self.has_placed.clone()
+        terminal_recontacted = self.recontacted.clone()
+        terminal_recontact_penalty = self.recontact_penalty_total.clone()
         terminal_goal_distance = torch.linalg.vector_norm(
             cube[:, :2] - self.goal_position[:, :2], dim=1
         )
@@ -682,7 +1266,21 @@ class PiperWarpEnv:
             still,
             terminal_has_lifted,
             terminal_goal_distance,
+            terminal_has_placed,
+            terminal_recontacted,
+            terminal_recontact_penalty,
+            recontact,
         )
+
+        # Exactly one cached sensor sample is produced per vector transition.
+        # Reads of get_observations below only select from this history.
+        self._advance_sensor_history(self._observation_tensor())
+        # One call to step is one curriculum tick, regardless of how many
+        # independent worlds were advanced in that call.
+        self.training_steps += 1
+        self._stage = self.training_config.stage_at(self.training_steps)
+        self.cfg["training_steps"] = self.training_steps
+        self.cfg["curriculum_stage"] = self._stage_at_runtime()
 
         # Capture terminal metrics before reset, then initialize only those
         # worlds.  Returned observations are always valid post-reset states.

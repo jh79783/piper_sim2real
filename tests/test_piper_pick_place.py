@@ -7,6 +7,7 @@ therefore exercises the same position actuators and contacts as training.
 
 import numpy as np
 import unittest
+from types import SimpleNamespace
 
 from scripts.piper_pick_place_env import PiperPickPlaceEnv
 
@@ -88,7 +89,7 @@ class PiperPickPlaceTests(unittest.TestCase):
         env = PiperPickPlaceEnv()
         try:
             observation, info = env.reset(seed=3)
-            self.assertEqual(observation.shape, (58,))
+            self.assertEqual(observation.shape, (59,))
             self.assertEqual(observation.dtype, np.float32)
             self.assertTrue(np.isfinite(observation).all())
             self.assertFalse(info["is_success"])
@@ -126,8 +127,98 @@ class PiperPickPlaceTests(unittest.TestCase):
                 self.assertTrue(info["released"])
                 self.assertTrue(info["on_table"])
                 self.assertTrue(info["object_still"])
+                self.assertFalse(info["recontacted"])
+                self.assertEqual(info["recontact_penalty"], 0.0)
             finally:
                 env.close()
+
+    def test_release_latch_and_recontact_penalty_semantics(self):
+        env = PiperPickPlaceEnv()
+        try:
+            env.reset(seed=0)
+            link6_geom = int(np.flatnonzero(
+                self._body_geom_mask(env, "link6")
+            )[0])
+            link7_geom = int(np.flatnonzero(
+                self._body_geom_mask(env, "link7")
+            )[0])
+            table_geom = int(env.model.geom("table").id)
+            fake = SimpleNamespace(
+                data=SimpleNamespace(contact=[
+                    SimpleNamespace(geom1=env.cube_geom, geom2=link6_geom, dist=0.0),
+                ]),
+                cube_geom=env.cube_geom,
+                robot_geoms=env.robot_geoms,
+            )
+            self.assertTrue(PiperPickPlaceEnv._robot_cube_contact(fake))
+            fake.data.contact = [
+                SimpleNamespace(geom1=link7_geom, geom2=env.cube_geom, dist=0.0),
+            ]
+            self.assertTrue(PiperPickPlaceEnv._robot_cube_contact(fake))
+            fake.data.contact = [
+                SimpleNamespace(geom1=table_geom, geom2=env.cube_geom, dist=0.0),
+            ]
+            self.assertFalse(PiperPickPlaceEnv._robot_cube_contact(fake))
+            fake.data.contact = [
+                SimpleNamespace(geom1=env.cube_geom, geom2=link6_geom, dist=0.002),
+            ]
+            self.assertFalse(PiperPickPlaceEnv._robot_cube_contact(fake))
+
+            # A contact before a valid release is not charged.
+            env.reset(seed=1)
+            env._robot_cube_contact = lambda: True
+            _, _, _, _, info = env.step(np.zeros(4))
+            self.assertFalse(info["recontacted"])
+            self.assertEqual(info["recontact_penalty"], 0.0)
+
+            # A release latch needs lift/inside/on-table/open/no-robot-contact;
+            # it intentionally does not require the eight-step success settle.
+            env.reset(seed=2)
+            env.has_lifted = True
+            env._placement_state = lambda: (True, True, False, True)
+            env._robot_cube_contact = lambda: False
+            env.step(np.zeros(4))
+            self.assertTrue(env.has_placed)
+            self.assertEqual(env.recontact_penalty_total, 0.0)
+
+            # Once latched, a recontact costs exactly the configured amount.
+            no_contact = PiperPickPlaceEnv()
+            with_contact = PiperPickPlaceEnv()
+            try:
+                no_contact.reset(seed=3)
+                with_contact.reset(seed=3)
+                no_contact.has_placed = True
+                with_contact.has_placed = True
+                no_contact._robot_cube_contact = lambda: False
+                with_contact._robot_cube_contact = lambda: True
+                _, reward_no_contact, _, _, _ = no_contact.step(np.zeros(4))
+                _, reward_contact, _, _, info = with_contact.step(np.zeros(4))
+                self.assertAlmostEqual(
+                    reward_no_contact - reward_contact,
+                    PiperPickPlaceEnv.recontact_penalty,
+                    places=5,
+                )
+                self.assertTrue(info["recontacted"])
+                self.assertAlmostEqual(info["recontact_penalty"], 0.2, places=6)
+            finally:
+                no_contact.close()
+                with_contact.close()
+
+            # The latch persists after the cube leaves the goal and only reset
+            # clears it; this prevents a later arm touch from becoming free.
+            env._placement_state = lambda: (False, False, False, True)
+            env._robot_cube_contact = lambda: False
+            env.step(np.zeros(4))
+            self.assertTrue(env.has_placed)
+            env.reset(seed=4)
+            self.assertFalse(env.has_placed)
+        finally:
+            env.close()
+
+    @staticmethod
+    def _body_geom_mask(env, body_name):
+        body_id = env.model.body(body_name).id
+        return env.model.geom_bodyid == body_id
 
     def test_success_rejects_pushing_holding_and_border_overlap(self):
         env = PiperPickPlaceEnv()

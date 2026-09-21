@@ -24,11 +24,16 @@ import time
 from typing import Any
 
 
-CHECKPOINT_SCHEMA = 1
+CHECKPOINT_SCHEMA = 2
 DEFAULT_OUTPUT_DIR = Path("runs/piper_pick_place")
 DEFAULT_STEPS_PER_ENV = 64
 DEFAULT_ITERATIONS = 10_000
 DEFAULT_TENSORBOARD_PORT = 6006
+EXPECTED_REWARD_VERSION = 2
+EXPECTED_PHYSICS_TIMESTEP = 0.002
+EXPECTED_CONTROL_HZ = 50.0
+EXPECTED_CONTROL_SUBSTEPS = 10
+EXPECTED_EPISODE_STEPS = 600
 
 
 def positive_int(value: str) -> int:
@@ -56,6 +61,245 @@ def tensorboard_port(value: str) -> int:
     if not 1024 <= number <= 65535:
         raise argparse.ArgumentTypeError("must be between 1024 and 65535")
     return number
+
+
+def _reward_contract(env) -> tuple[int, float]:
+    """Return and validate the Piper environment's reward contract.
+
+    The reward version is part of the policy/checkpoint contract.  Refusing an
+    older environment here prevents a run from silently mixing reward-v1
+    transitions with the v2 policy metadata.
+    """
+
+    missing = [
+        name
+        for name in ("reward_version", "recontact_penalty")
+        if not hasattr(env, name)
+    ]
+    if missing:
+        raise RuntimeError(
+            "PiperWarpEnv is missing reward contract field(s) "
+            f"{', '.join(missing)}; use the reward-v2 environment and start a fresh run"
+        )
+    reward_version = int(env.reward_version)
+    recontact_penalty = float(env.recontact_penalty)
+    if reward_version != EXPECTED_REWARD_VERSION:
+        raise RuntimeError(
+            f"Unsupported Piper reward_version={reward_version}; expected "
+            f"{EXPECTED_REWARD_VERSION}. Start a fresh run with the reward-v2 environment."
+        )
+    if not math.isfinite(recontact_penalty) or recontact_penalty < 0.0:
+        raise RuntimeError(
+            f"Unsupported Piper recontact_penalty={recontact_penalty!r}; expected a "
+            "finite non-negative value. Start a fresh run with the reward-v2 environment."
+        )
+    return reward_version, recontact_penalty
+
+
+def _training_config_class():
+    """Import the light-weight training config without breaking direct scripts."""
+
+    # ``python scripts/train_piper_rsl.py --help`` has no repository root on
+    # every Python installation's import path.  Keep this import lazy and
+    # provide the sibling-module fallback used by that invocation.
+    try:
+        from scripts.piper_training_config import PiperTrainingConfig
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"scripts", "scripts.piper_training_config"}:
+            raise
+        from piper_training_config import PiperTrainingConfig
+    return PiperTrainingConfig
+
+
+def _make_training_config(args):
+    """Build the immutable environment config represented by CLI toggles."""
+
+    config_class = _training_config_class()
+    return config_class(
+        domain_randomization=not args.no_domain_randomization,
+        sensor_noise=not args.no_sensor_noise,
+        curriculum=not args.no_curriculum,
+    )
+
+
+def _jsonable(value):
+    """Convert config/dataclass values into stable JSON/checkpoint values."""
+
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        value = value.to_dict()
+    elif hasattr(value, "__dataclass_fields__"):
+        from dataclasses import asdict
+
+        value = asdict(value)
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, (str, bool, int)) or value is None:
+        return value
+    if isinstance(value, float):
+        return float(value)
+    raise TypeError(f"Unsupported training config value {type(value).__name__}")
+
+
+def _training_config_dict(args, env=None):
+    if env is None:
+        config = _make_training_config(args)
+    else:
+        config = getattr(env, "training_config", None)
+        if config is None or not callable(getattr(config, "to_dict", None)):
+            raise RuntimeError("PiperWarpEnv must expose training_config.to_dict() for checkpoint metadata")
+    return _jsonable(config)
+
+
+def _env_cfg(env) -> dict:
+    config = getattr(env, "cfg", None)
+    if isinstance(config, dict):
+        return _jsonable(config)
+    return {}
+
+
+def _timing_contract(env) -> dict:
+    """Return canonical physical/control timing metadata for schema checks."""
+
+    model = getattr(env, "model", None)
+    opt = getattr(model, "opt", None)
+    if opt is None or not hasattr(opt, "timestep"):
+        raise RuntimeError("PiperWarpEnv must expose env.model.opt.timestep for the timing contract")
+    if not hasattr(env, "frame_skip") or not hasattr(env, "max_episode_length"):
+        raise RuntimeError("PiperWarpEnv must expose frame_skip and max_episode_length for the timing contract")
+    timestep = float(opt.timestep)
+    control_substeps = int(env.frame_skip)
+    control_hz = 1.0 / (timestep * control_substeps)
+    episode_steps = int(env.max_episode_length)
+    episode_seconds = episode_steps / control_hz
+    return {
+        "physics_timestep": timestep,
+        "control_hz": control_hz,
+        "control_substeps": control_substeps,
+        "episode_steps": episode_steps,
+        "episode_seconds": episode_seconds,
+    }
+
+
+def _validate_timing_contract(env) -> dict:
+    timing = _timing_contract(env)
+    expected = {
+        "physics_timestep": EXPECTED_PHYSICS_TIMESTEP,
+        "control_hz": EXPECTED_CONTROL_HZ,
+        "control_substeps": EXPECTED_CONTROL_SUBSTEPS,
+        "episode_steps": EXPECTED_EPISODE_STEPS,
+        "episode_seconds": EXPECTED_EPISODE_STEPS / EXPECTED_CONTROL_HZ,
+    }
+    for key, value in expected.items():
+        actual = timing[key]
+        if isinstance(value, float):
+            matches = math.isclose(float(actual), value, rel_tol=0.0, abs_tol=1e-9)
+        else:
+            matches = actual == value
+        if not matches:
+            raise RuntimeError(
+                f"Unsupported Piper timing {key}={actual!r}; expected {value!r}. "
+                "The schema-2 trainer requires 0.002 s x 10 at 50 Hz and 600 ticks."
+            )
+    return timing
+
+
+def _observation_contract(env, obs) -> dict:
+    policy = obs.get("policy") if hasattr(obs, "get") else None
+    critic = obs.get("critic") if hasattr(obs, "get") else None
+    if policy is None:
+        raise ValueError("Piper observations must include a 'policy' group")
+    if critic is None:
+        raise ValueError("Piper observations must include a separate 'critic' group")
+    env_cfg = getattr(env, "cfg", None)
+    if not isinstance(env_cfg, dict):
+        raise RuntimeError("PiperWarpEnv must expose cfg with observation_version and action_semantics")
+    for key in ("observation_version", "action_semantics"):
+        if key not in env_cfg:
+            raise RuntimeError(f"PiperWarpEnv cfg is missing required field {key!r}")
+    obs_groups = env_cfg.get("obs_groups", {"actor": ["policy"], "critic": ["critic"]})
+    if not isinstance(obs_groups, dict) or set(obs_groups) != {"actor", "critic"}:
+        raise RuntimeError("PiperWarpEnv cfg obs_groups must contain actor and critic lists")
+    normalized_groups = {}
+    for name in ("actor", "critic"):
+        groups = obs_groups[name]
+        if not isinstance(groups, (list, tuple)) or not groups or not all(isinstance(group, str) for group in groups):
+            raise RuntimeError(f"PiperWarpEnv cfg obs_groups[{name!r}] must be a non-empty list of names")
+        missing = [group for group in groups if group not in obs]
+        if missing:
+            raise ValueError(f"Piper observations are missing {name} group(s): {missing}")
+        normalized_groups[name] = list(groups)
+    actor_obs_dim = sum(int(obs[group].shape[-1]) for group in normalized_groups["actor"])
+    critic_obs_dim = sum(int(obs[group].shape[-1]) for group in normalized_groups["critic"])
+    vision_config = env_cfg.get("vision_config")
+    if vision_config is not None:
+        vision_config = _jsonable(vision_config)
+    has_vision = "vision" in normalized_groups["actor"]
+    if has_vision != (vision_config is not None):
+        raise RuntimeError("Piper RGB observations and vision_config metadata must be enabled together")
+    return {
+        "observation_version": str(env_cfg["observation_version"]),
+        "num_obs": int(policy.shape[-1]),
+        "num_critic_obs": int(critic.shape[-1]),
+        "actor_obs_dim": actor_obs_dim,
+        "critic_obs_dim": critic_obs_dim,
+        "obs_groups": normalized_groups,
+        "action_semantics": str(env_cfg["action_semantics"]),
+        "vision_config": vision_config,
+    }
+
+
+def _env_training_steps(env) -> int:
+    if not hasattr(env, "training_steps"):
+        raise RuntimeError("PiperWarpEnv must expose training_steps for checkpoint progression")
+    value = env.training_steps
+    item = getattr(value, "item", None)
+    if callable(item):
+        value = item()
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"Piper training_steps must be non-negative, got {value}")
+    return value
+
+
+def _set_env_training_steps(env, count: int) -> None:
+    count = int(count)
+    if count < 0:
+        raise ValueError(f"Piper training_steps must be non-negative, got {count}")
+    setter = getattr(env, "set_training_steps", None)
+    if not callable(setter):
+        raise ValueError(
+            "Resume checkpoint requires PiperWarpEnv.set_training_steps(count) "
+            "to restore curriculum progression"
+        )
+    setter(count)
+
+
+def _normalization_state_present(state_dict) -> bool:
+    if not isinstance(state_dict, dict):
+        return False
+    return any("normalizer" in str(key).lower() for key in state_dict)
+
+
+def _check_normalization_state(payload: dict, train_cfg: dict, runner=None) -> None:
+    """Verify actual RSL actor/critic state dicts carry empirical statistics."""
+
+    actor_state = payload.get("actor_state_dict")
+    critic_state = payload.get("critic_state_dict")
+    if not isinstance(actor_state, dict) or not isinstance(critic_state, dict):
+        raise ValueError("RSL-RL checkpoint must contain actor_state_dict and critic_state_dict mappings")
+    checks = (
+        ("actor", actor_state, train_cfg.get("actor", {}).get("obs_normalization", False)),
+        ("critic", critic_state, train_cfg.get("critic", {}).get("obs_normalization", False)),
+    )
+    for name, state, enabled in checks:
+        if not enabled:
+            continue
+        if not _normalization_state_present(state):
+            raise ValueError(
+                f"RSL {name} state_dict is missing empirical observation-normalization statistics"
+            )
 
 
 def parse_args(argv=None):
@@ -91,9 +335,40 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--start-mode",
-        choices=("above_cube", "home"),
-        default="above_cube",
-        help="Piper reset pose: near the cube for learning, or fixed home pose",
+        choices=("curriculum", "above_cube", "home"),
+        default="curriculum",
+        help="Piper reset policy: curriculum, near-cube above_cube, or fixed home pose",
+    )
+    parser.add_argument(
+        "--no-domain-randomization",
+        action="store_true",
+        help="disable per-episode physical parameter randomization",
+    )
+    parser.add_argument(
+        "--no-sensor-noise",
+        action="store_true",
+        help="disable actor sensor noise, zero offsets, and observation delay",
+    )
+    parser.add_argument(
+        "--no-curriculum",
+        action="store_true",
+        help="hold the curriculum at its final difficulty stage",
+    )
+    parser.add_argument(
+        "--rgb",
+        action="store_true",
+        help="enable the optional frozen ResNet RGB policy input alongside proprioception",
+    )
+    parser.add_argument(
+        "--rgb-encoder-checkpoint",
+        type=Path,
+        help="offline RGB encoder weights for a fresh run (resume loads weights from the .pt checkpoint)",
+    )
+    parser.add_argument(
+        "--rgb-camera-fps",
+        type=positive_float,
+        default=30.0,
+        help="simulated RGB capture rate in Hz (default: 30)",
     )
     parser.add_argument(
         "--resume",
@@ -118,6 +393,8 @@ def parse_args(argv=None):
     # runs remain intentionally unrestricted for GPU throughput experiments.
     if not args.headless and args.num_envs < 1:
         parser.error("--num-envs must be at least one")
+    if args.rgb_encoder_checkpoint is not None and not args.rgb:
+        parser.error("--rgb-encoder-checkpoint requires --rgb")
     return args
 
 
@@ -300,10 +577,14 @@ def _render_frames(env):
     return frames
 
 
-def _make_train_cfg(args, *, num_obs: int, num_actions: int) -> dict:
+def _make_train_cfg(args, *, num_obs: int, num_actions: int, obs_groups: dict | None = None) -> dict:
     """Build the rsl_rl 5.x OnPolicyRunner configuration."""
 
     del num_obs, num_actions  # dimensions are inferred from TensorDict/env.
+    if obs_groups is None:
+        obs_groups = {"actor": ["policy"], "critic": ["critic"]}
+    else:
+        obs_groups = {name: list(groups) for name, groups in obs_groups.items()}
     return {
         "seed": args.seed,
         "runner_class_name": "OnPolicyRunner",
@@ -312,7 +593,7 @@ def _make_train_cfg(args, *, num_obs: int, num_actions: int) -> dict:
         "save_interval": args.save_interval,
         "logger": "tensorboard",
         "run_name": "piper_pick_place",
-        "obs_groups": {"actor": ["policy"], "critic": ["policy"]},
+        "obs_groups": obs_groups,
         "actor": {
             "class_name": "rsl_rl.models:MLPModel",
             "hidden_dims": [256, 128, 64],
@@ -335,8 +616,10 @@ def _make_train_cfg(args, *, num_obs: int, num_actions: int) -> dict:
             "num_learning_epochs": 5,
             "num_mini_batches": 4,
             "clip_param": 0.2,
-            "gamma": 0.99,
-            "lam": 0.95,
+            # Keep the potential-shaping discount and PPO trace on the same
+            # physical horizon after moving to the 50 Hz control tick.
+            "gamma": math.sqrt(0.99),
+            "lam": math.sqrt(0.95),
             "value_loss_coef": 1.0,
             "entropy_coef": 0.01,
             "learning_rate": 3.0e-4,
@@ -362,21 +645,49 @@ def _checkpoint_schema(
     train_cfg: dict,
     total_steps: int = 0,
     lifetime_total_steps: int = 0,
+    training_steps: int | None = None,
 ) -> dict:
-    policy = obs.get("policy")
+    observation = _observation_contract(env, obs)
+    reward_version, recontact_penalty = _reward_contract(env)
+    if training_steps is None:
+        training_steps = _env_training_steps(env)
+    normalization = {
+        "actor": bool(train_cfg["actor"].get("obs_normalization", False)),
+        "critic": bool(train_cfg["critic"].get("obs_normalization", False)),
+    }
     return {
         "schema_version": CHECKPOINT_SCHEMA,
         "task": "piper_pick_place",
         "algorithm": "rsl_rl.PPO",
         "rsl_rl_config": "v5",
-        "num_obs": int(policy.shape[-1]),
+        "start_mode": str(args.start_mode),
+        "num_obs": observation["num_obs"],
+        "num_critic_obs": observation["num_critic_obs"],
+        "actor_obs_dim": observation["actor_obs_dim"],
+        "critic_obs_dim": observation["critic_obs_dim"],
         "num_actions": int(env.num_actions),
+        "reward_version": reward_version,
+        "recontact_penalty": recontact_penalty,
         "steps_per_env": int(args.steps_per_env),
         "iteration": int(iteration),
         "actor_hidden_dims": list(train_cfg["actor"]["hidden_dims"]),
         "critic_hidden_dims": list(train_cfg["critic"]["hidden_dims"]),
         "actor_activation": str(train_cfg["actor"]["activation"]),
         "critic_activation": str(train_cfg["critic"]["activation"]),
+        "observation_version": observation["observation_version"],
+        "obs_groups": observation["obs_groups"],
+        "normalization": normalization,
+        "actor_obs_normalization": normalization["actor"],
+        "critic_obs_normalization": normalization["critic"],
+        "gamma": float(train_cfg["algorithm"]["gamma"]),
+        "lam": float(train_cfg["algorithm"]["lam"]),
+        "action_semantics": observation["action_semantics"],
+        "vision_config": observation["vision_config"],
+        "timing": _timing_contract(env),
+        "training_config": _training_config_dict(args, env),
+        # This is a vector-environment tick count, independent of the number
+        # of worlds and PPO rollout batch size.  It is restored on resume.
+        "training_steps": int(training_steps),
         # This is transitions collected in the run that wrote this file. It
         # lets a resumed summary distinguish new work from lifetime progress.
         "total_steps": int(total_steps),
@@ -399,25 +710,66 @@ def _load_resume_schema(path: Path, args, env, obs, train_cfg: dict, *, torch):
         "task",
         "algorithm",
         "rsl_rl_config",
+        "start_mode",
         "num_obs",
+        "num_critic_obs",
+        "actor_obs_dim",
+        "critic_obs_dim",
         "num_actions",
+        "steps_per_env",
         "actor_hidden_dims",
         "critic_hidden_dims",
         "actor_activation",
         "critic_activation",
+        "reward_version",
+        "recontact_penalty",
+        "observation_version",
+        "obs_groups",
+        "normalization",
+        "actor_obs_normalization",
+        "critic_obs_normalization",
+        "gamma",
+        "lam",
+        "action_semantics",
+        "vision_config",
+        "timing",
+        "training_config",
     ):
-        if key in ("actor_activation", "critic_activation") and key not in schema:
+        if key not in schema:
+            explanation = "the checkpoint predates the schema-2 timing/observation contract"
+            if key in {"actor_activation", "critic_activation"}:
+                explanation = "the checkpoint predates the tanh MLP schema"
+            elif key in {"reward_version", "recontact_penalty"}:
+                explanation = "the checkpoint predates the reward-v2 contract"
             raise ValueError(
-                f"Incompatible resume checkpoint: missing {key}; "
-                "the checkpoint predates the tanh MLP schema, so start a fresh run"
+                f"Incompatible resume checkpoint: missing {key}; {explanation}; "
+                "start a fresh run"
             )
         if schema.get(key) != expected.get(key):
             raise ValueError(
                 f"Incompatible resume checkpoint field {key!r}: "
-                f"expected {expected.get(key)!r}, got {schema.get(key)!r}"
+                f"expected {expected.get(key)!r}, got {schema.get(key)!r}; "
+                "start a fresh run"
             )
+    if "training_steps" not in schema:
+        raise ValueError(
+            "Incompatible resume checkpoint: missing training_steps; "
+            "curriculum progression cannot be restored; start a fresh run"
+        )
+    try:
+        if int(schema["training_steps"]) < 0:
+            raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Incompatible resume checkpoint: training_steps must be a non-negative integer") from exc
     if not isinstance(payload.get("actor_state_dict"), dict) or not isinstance(payload.get("critic_state_dict"), dict):
         raise ValueError("Resume checkpoint is missing RSL-RL actor/critic state dictionaries")
+    if expected["vision_config"] is not None:
+        if not isinstance(payload.get("vision_encoder_state_dict"), dict):
+            raise ValueError(
+                "RGB resume checkpoint is missing vision_encoder_state_dict; "
+                "RGB and state-only checkpoints are incompatible"
+            )
+    _check_normalization_state(payload, train_cfg)
     return payload
 
 
@@ -436,14 +788,24 @@ def _save_checkpoint(
     infos=None,
 ):
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = runner.alg.save()
+    payload = dict(runner.alg.save())
+    checkpoint_state = getattr(env, "checkpoint_state", None)
+    if callable(checkpoint_state):
+        extra = checkpoint_state()
+        if not isinstance(extra, dict):
+            raise ValueError("Piper environment checkpoint_state() must return a mapping")
+        payload.update(extra)
+    _check_normalization_state(payload, train_cfg, runner=runner)
+    current_training_steps = _env_training_steps(env)
     payload["iter"] = int(iteration)
     checkpoint_infos = dict(infos or {})
     if lifetime_total_steps is None:
         lifetime_total_steps = total_steps
     checkpoint_infos["total_steps"] = int(total_steps)
     checkpoint_infos["lifetime_total_steps"] = int(lifetime_total_steps)
+    checkpoint_infos["training_steps"] = current_training_steps
     payload["infos"] = checkpoint_infos
+    payload["training_steps"] = current_training_steps
     payload["piper_schema"] = _checkpoint_schema(
         args,
         env,
@@ -452,6 +814,7 @@ def _save_checkpoint(
         train_cfg=train_cfg,
         total_steps=total_steps,
         lifetime_total_steps=lifetime_total_steps,
+        training_steps=current_training_steps,
     )
     # Avoid leaving a truncated ``model.pt`` if Ctrl+C/disk failure occurs
     # during serialization. The temporary file stays beside the destination so
@@ -529,6 +892,7 @@ def _train_iterations(
             logger.process_env_step(rewards, dones, infos)
             state["latest_obs"] = obs
             state["total_steps"] += int(env.num_envs)
+            state["training_steps"] = _env_training_steps(env)
             if viewer is not None and time.monotonic() - viewer.last_draw >= viewer.interval:
                 try:
                     if not viewer.maybe_draw(_render_frames(env), state["total_steps"], str(device)):
@@ -602,6 +966,12 @@ def main(argv=None) -> int:
         from scripts.piper_warp_env import PiperWarpEnv
     except ImportError as exc:
         raise RuntimeError("scripts.piper_warp_env.PiperWarpEnv is required for this launcher") from exc
+    PiperRGBEnv = None
+    if args.rgb:
+        try:
+            from scripts.piper_rgb_env import PiperRGBEnv
+        except ImportError as exc:
+            raise RuntimeError("--rgb requires scripts.piper_rgb_env.PiperRGBEnv") from exc
     try:
         from rsl_rl.runners import OnPolicyRunner
     except ImportError as exc:
@@ -612,35 +982,98 @@ def main(argv=None) -> int:
     tb_process = None
     env = viewer = runner = None
     train_cfg = None
+    training_config = None
     status = "error"
     latest_obs = None
     prior_total_steps = 0
     checkpoint_saved = False
     checkpoint_error = None
+    # An incompatible or malformed resume must not fall through to the
+    # finally block and create a misleading fresh checkpoint.  This becomes
+    # true only after schema validation and runner.load both succeed.
+    resume_checkpoint_ready = args.resume is None
     state = {
         "latest_obs": None,
         "total_steps": 0,
+        "training_steps": 0,
         "last_iteration": -1,
         "stop_requested": False,
         "window_stop_requested": False,
         "completed": False,
     }
     preview_frames = 0
+    resume_payload_hint = None
     try:
+        training_config = _make_training_config(args)
+        if args.rgb and args.resume is not None:
+            if args.resume.suffix.lower() != ".pt" or not args.resume.is_file():
+                raise ValueError("RGB resume requires an existing RSL-RL .pt checkpoint")
+            # Load the CPU checkpoint before constructing the encoder.  The
+            # RGB wrapper uses its frozen state dict offline, so a resume can
+            # never silently download/randomly initialize a different encoder.
+            resume_payload_hint = torch.load(args.resume, map_location="cpu", weights_only=False)
         env = PiperWarpEnv(
             num_envs=args.num_envs,
             device=args.device,
             seed=args.seed,
             start_mode=args.start_mode,
+            training_config=training_config,
         )
+        if args.rgb:
+            env = PiperRGBEnv(
+                env,
+                encoder_checkpoint=resume_payload_hint,
+                encoder_weights=args.rgb_encoder_checkpoint,
+                camera_fps=args.rgb_camera_fps,
+            )
+        timing = _validate_timing_contract(env)
         _reset_environment(env, args.seed)
         latest_obs = _observation_from_env(env, device=torch.device(args.device))
         state["latest_obs"] = latest_obs
+        state["training_steps"] = _env_training_steps(env)
         if "policy" not in latest_obs:
             raise ValueError(f"PiperWarpEnv observations must include a 'policy' group, got {list(latest_obs.keys())}")
+        if "critic" not in latest_obs:
+            raise ValueError(
+                "PiperWarpEnv observations must include separate clean 'critic' and noisy 'policy' groups"
+            )
         num_obs = int(latest_obs["policy"].shape[-1])
+        num_critic_obs = int(latest_obs["critic"].shape[-1])
+        declared_num_obs = getattr(env, "num_observations", None)
+        if declared_num_obs is None or int(declared_num_obs) != num_obs:
+            raise RuntimeError(
+                "PiperWarpEnv observation contract mismatch: "
+                f"declared num_observations={declared_num_obs!r}, returned policy width={num_obs}"
+            )
         num_actions = int(env.num_actions)
-        train_cfg = _make_train_cfg(args, num_obs=num_obs, num_actions=num_actions)
+        reward_version, recontact_penalty = _reward_contract(env)
+        observation_contract = _observation_contract(env, latest_obs)
+        train_cfg = _make_train_cfg(
+            args,
+            num_obs=num_obs,
+            num_actions=num_actions,
+            obs_groups=observation_contract["obs_groups"],
+        )
+        shaping_gamma = getattr(env, "shaping_gamma", None)
+        if shaping_gamma is None or not math.isclose(
+            float(shaping_gamma), train_cfg["algorithm"]["gamma"], rel_tol=0.0, abs_tol=1e-9
+        ):
+            raise RuntimeError(
+                "Piper shaping_gamma and PPO gamma disagree; both must use sqrt(0.99) "
+                "for the 50 Hz physical horizon"
+            )
+        training_config_dict = _training_config_dict(args, env)
+        env_cfg = _env_cfg(env)
+        env_cfg.update(
+            {
+                "training_config": training_config_dict,
+                "timing": timing,
+                "observation_version": observation_contract["observation_version"],
+                "action_semantics": observation_contract["action_semantics"],
+                "vision_config": observation_contract["vision_config"],
+                "rgb": args.rgb,
+            }
+        )
         train_cfg_for_file = deepcopy(train_cfg)
         config = vars(args).copy()
         config.update(
@@ -649,15 +1082,28 @@ def main(argv=None) -> int:
                 "algorithm": "rsl_rl.PPO",
                 "physics": "MuJoCo Warp (GPU)",
                 "num_obs": num_obs,
+                "num_critic_obs": num_critic_obs,
+                "actor_obs_dim": observation_contract["actor_obs_dim"],
+                "critic_obs_dim": observation_contract["critic_obs_dim"],
                 "num_actions": num_actions,
+                "reward_version": reward_version,
+                "recontact_penalty": recontact_penalty,
                 "num_envs": env.num_envs,
                 "device": str(env.device),
                 "train_cfg": train_cfg_for_file,
+                "training_config": training_config_dict,
+                "env_cfg": env_cfg,
+                "timing": timing,
+                "observation_version": observation_contract["observation_version"],
+                "action_semantics": observation_contract["action_semantics"],
+                "vision_config": observation_contract["vision_config"],
+                "rgb": args.rgb,
                 "output_dir": str(args.output_dir),
                 "resume": str(args.resume) if args.resume else None,
             }
         )
         (run_dir / "config.json").write_text(json.dumps(config, indent=2, default=str) + "\n", encoding="utf-8")
+        (run_dir / "env.cfg").write_text(json.dumps(env_cfg, indent=2, default=str) + "\n", encoding="utf-8")
         print(f"Run directory: {run_dir.resolve()}", flush=True)
         print(f"{env.num_envs} GPU Warp environments -> one RSL-RL PPO policy on CUDA", flush=True)
         if not args.no_tensorboard:
@@ -676,6 +1122,7 @@ def main(argv=None) -> int:
         start_iteration = 0
         if args.resume is not None:
             resume_payload = _load_resume_schema(args.resume, args, env, latest_obs, train_cfg, torch=torch)
+            resume_schema = resume_payload["piper_schema"]
             resume_infos = resume_payload.get("infos") or {}
             prior_total_steps = int(
                 resume_infos.get(
@@ -687,11 +1134,21 @@ def main(argv=None) -> int:
                 )
             )
             runner.load(str(args.resume), map_location=args.device)
+            _set_env_training_steps(env, int(resume_schema["training_steps"]))
+            # Loading a checkpoint initializes policy/critic state first.  The
+            # environment then resets at the restored curriculum tick and the
+            # runner starts from the resulting observation, including any
+            # sensor-history state owned by the environment.
+            _reset_environment(env, args.seed)
+            latest_obs = _observation_from_env(env, device=torch.device(args.device))
+            state["latest_obs"] = latest_obs
+            state["training_steps"] = _env_training_steps(env)
             # rsl_rl stores the last completed zero-based iteration. Continue
             # at the next one so a resumed run never silently duplicates it.
             start_iteration = int(runner.current_learning_iteration) + 1
             runner.current_learning_iteration = start_iteration - 1
             state["last_iteration"] = start_iteration - 1
+            resume_checkpoint_ready = True
             print(f"Resumed RSL-RL checkpoint: {args.resume} (next iteration {start_iteration})", flush=True)
 
         def save_periodic(iteration, obs, _total_steps):
@@ -733,7 +1190,7 @@ def main(argv=None) -> int:
     finally:
         # Save the latest complete PPO state even when the user interrupted
         # between updates. A partial rollout is intentionally not optimized.
-        if runner is not None and latest_obs is not None and train_cfg is not None:
+        if resume_checkpoint_ready and runner is not None and latest_obs is not None and train_cfg is not None:
             try:
                 _save_checkpoint(
                     runner,
@@ -780,11 +1237,20 @@ def main(argv=None) -> int:
                         viewer.close()
                 finally:
                     _terminate_process_group(tb_process)
+        summary_training_steps = int(state.get("training_steps", 0))
+        if env is not None:
+            try:
+                summary_training_steps = _env_training_steps(env)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # Preserve the original training failure if an environment
+                # died before it could expose its progress counter.
+                pass
         summary = {
             "status": status,
             "task": "piper_pick_place",
             "algorithm": "rsl_rl.PPO",
             "physics": "MuJoCo Warp (GPU)",
+            "rgb": bool(args.rgb),
             "device": args.device,
             "num_envs": args.num_envs,
             "steps_per_env": args.steps_per_env,
@@ -793,6 +1259,7 @@ def main(argv=None) -> int:
             "total_timesteps": int(state.get("total_steps", 0)),
             "previous_total_timesteps": prior_total_steps,
             "lifetime_total_timesteps": prior_total_steps + int(state.get("total_steps", 0)),
+            "training_steps": summary_training_steps,
             "tensorboard": not args.no_tensorboard,
             "tensorboard_port": args.tensorboard_port if not args.no_tensorboard else None,
             "preview_frames": preview_frames,

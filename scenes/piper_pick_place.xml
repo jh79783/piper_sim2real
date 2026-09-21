@@ -12,6 +12,12 @@
   </asset>
   <worldbody>
     <light pos="0.3 -0.4 1.2" dir="0 0 -1" directional="true"/>
+    <!-- Fixed simulator viewpoint for the optional RGB policy input.  The
+         orientation aims at the static workspace center and never tracks a
+         task body.  These values are a stable training camera, not D455
+         intrinsics. -->
+    <camera name="policy_rgb" mode="fixed" pos="0.70 -0.70 0.72"
+            xyaxes="0.879 0.477 0 -0.299 0.550 0.780" fovy="65"/>
     <geom name="floor" type="plane" pos="0 0 -0.06" size="1 1 0.02" rgba="0.12 0.14 0.16 1"/>
     <geom name="table" type="box" pos="0.25 0 -0.03" size="0.40 0.36 0.03"
           material="table_material" friction="1 0.005 0.0001"/>

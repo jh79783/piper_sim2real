@@ -19,6 +19,8 @@ git submodule update --init third_party/mujoco_menagerie
 
 [Piper real2sim 비교와 IMU·BAM 검토](docs/piper_real2sim_reference_comparison.md)에서
 초기 구현과 현재 구성, 실기 적용 시 필요한 작업을 확인할 수 있습니다.
+[학습 robustness 설정](docs/piper_training_robustness.md)에는 50Hz 시간 기준,
+물리·센서 randomization, curriculum stage와 checkpoint 조건을 정리했습니다.
 
 ## Piper pick-and-place (기본 실행)
 
@@ -26,8 +28,13 @@ git submodule update --init third_party/mujoco_menagerie
 Piper arm pick-and-place입니다. WSL Ubuntu의 관리형 Podman 이미지
 `localhost/piper-rsl:gpu`를 프로젝트에 마운트해 실행합니다.
 Actor와 critic MLP의 기본 activation은 `tanh`이며, 이전 ELU 설정으로 만든
-checkpoint는 호환되지 않으므로 새 학습을 시작해야 합니다. 스크립트 변경만으로
-적용되므로 이미지 재빌드는 필요하지 않습니다.
+checkpoint는 호환되지 않으므로 새 학습을 시작해야 합니다. 현재 기본 경로는
+물리 `0.002 s × 10`의 50Hz, 600 policy tick (12초)이며, 초기 25Hz/300-tick
+Piper checkpoint와 schema 2 이전 checkpoint는 호환되지 않습니다. 정책은 7차원
+normalized direct joint/gripper target을 내고, 63차원 state/action-history를
+사용합니다. actor에는 noisy/delayed sensor state, critic에는 clean observation을
+제공하며 둘 다 empirical normalization을 켭니다. 스크립트 변경만으로 적용되므로
+이미지 재빌드는 필요하지 않습니다.
 
 이미지가 없다면 다음처럼 한 번 빌드합니다. 기존 `Containerfile`과
 `localhost/piper-rl:gpu` 이미지는 legacy Reacher 경로를 위해 보존됩니다.
@@ -57,17 +64,24 @@ bash scripts/run_piper_pick_place.sh --headless
 bash scripts/run_piper_pick_place.sh --no-tensorboard
 bash scripts/run_piper_pick_place.sh --tensorboard-port 6007
 
-# bounded smoke: 64 steps/env × 5 iterations = 320 steps/env
-# 300-step episode/reset과 task metric event까지 확인
-bash scripts/run_piper_pick_place.sh --headless --num-envs 64 --steps-per-env 64 --iterations 5 \
+# bounded smoke: 64 environments × 10 steps/env = 640 transitions/env
+# 600-tick episode timeout 경계까지 확인
+bash scripts/run_piper_pick_place.sh --headless --num-envs 64 --steps-per-env 64 --iterations 10 \
     --tensorboard-port 16006
 
-# 호환 가능한 RSL-RL .pt 재개 / fixed home pose 변형
+# 호환 가능한 schema-2 RSL-RL .pt 재개 / fixed home pose 변형
 bash scripts/run_piper_pick_place.sh --resume runs/piper_pick_place/<run>/model.pt
 bash scripts/run_piper_pick_place.sh --start-mode home
+
+# uncertainty/curriculum controls
+bash scripts/run_piper_pick_place.sh --no-domain-randomization
+bash scripts/run_piper_pick_place.sh --no-sensor-noise
+bash scripts/run_piper_pick_place.sh --no-curriculum
 ```
 
-기본 `above_cube` 시작은 탐색을 돕기 위해 TCP를 cube 근처에 둡니다. 이는
+기본 실행은 curriculum, domain randomization, sensor noise를 켭니다. `--no-curriculum`은
+최종 난이도를 바로 사용하며, `--start-mode above_cube`와 `--start-mode home`으로
+시작 pose를 선택할 수 있습니다. 기본 `above_cube` 시작은 탐색을 돕기 위해 TCP를 cube 근처에 둡니다. 이는
 이미 풀렸다는 뜻이 아니며 `home`은 접근과 grasp부터 학습해야 합니다. Cube
 XY와 직사각형 goal XY는 매 reset마다 독립적으로 randomize됩니다. 성공은
 reward가 높거나 cube에 닿은 것이 아니라, 실제 finger 접촉 grasp, lift,
@@ -77,9 +91,26 @@ goal 내부 배치, gripper release, 안정 정지를 모두 만족해야 합니
 일반화, 실물 성공을 주장할 수 없으므로 여러 seed의 `task/success_rate`를
 확인하세요.
 
+Observation은 63차원이며, 앞의 56개 state field 뒤에 직전 7차원 raw action이
+붙습니다. 마지막 state `has_placed` bit는 처음에는 0입니다.
+실제 grasp/lift 뒤 cube가 goal 안에 있고 table 위에 있으며 release되고,
+그 control step에 robot-cube contact가 없을 때 latch가 1이 되어 episode 끝까지
+유지됩니다. 그 뒤 cube가 goal 밖으로 움직이더라도 latch는 유지되며, 이후
+contact가 감지된 control step에만 0.2의 `recontact_penalty`를 적용합니다.
+따라서 접촉이 없는 남은 step 전체에 매번 penalty를 주는 것은 아닙니다.
+이는 full-task `task/success_rate` 정의를 바꾸지 않는 reward-v2 동작입니다.
+`task/recontact_rate`와 episode의 양의 누적 비용인 `task/recontact_penalty`를
+함께 확인하세요. 현재 계수는 검증용 설정이며 최적 benchmark라고 주장하지 않습니다.
+기존 reward-v1 또는 58차원 run의 reward/return은 새 run과 직접 비교하지 말고,
+`--resume` 없이 새 학습을 시작하세요.
+
 첫 실행은 Warp CUDA kernel compile으로 잠시 지연될 수 있으며 cache는
 `.cache/warp`에 보존됩니다. 학습 물리와 PPO는 GPU에서 실행되며, episode
-초기화용 IK helper와 WSLg software rendering은 CPU를 사용할 수 있지만
+초기화용 IK helper는 CPU를 사용할 수 있습니다. GUI는 기본적으로 WSLg D3D12
+GPU rendering을 사용하며, `PIPER_RENDERER=software bash scripts/run_piper_pick_place.sh`
+로 명시적인 software fallback을 선택할 수 있습니다. GPU GUI 모드에서 필요한
+`/dev/dxg` 또는 `/usr/lib/wsl/lib` 라이브러리가 없으면 wrapper가 조용히 CPU로
+전환하지 않고 오류를 냅니다. `--headless`는 WSLg graphics checks를 건너뜁니다.
 rollout physics를 CPU에서 별도로 step하지 않습니다. Esc, 창 닫기, Ctrl+C는
 checkpoint, summary, 환경, TensorBoard child를 정리합니다. `--device cpu`는 지원하지 않으며
 CUDA가 없으면 hard error입니다. 이 코드는 simulation 검증용이고 실제
@@ -91,7 +122,8 @@ Piper/CAN/motor 명령을 보내지 않습니다.
 실행 결과는 `runs/piper_pick_place/<timestamp>/`에 저장됩니다: `model.pt`,
 `model_<iteration>.pt`, `tensorboard/`, `config.json`, `summary.json`, 그리고
 GUI 사용 시 `preview.png`. TensorBoard에서 `task/success_rate` (full-task),
-`task/lift_rate`, `task/final_goal_distance`, `Train/mean_reward`를 보세요.
+`task/lift_rate`, `task/final_goal_distance`, `task/recontact_rate`,
+`task/recontact_penalty`, `Train/mean_reward`를 보세요.
 Reward만으로 과제 성공을 판단하지 마세요.
 
 종료 후 로그를 보려면 standalone helper를 사용합니다. 역시 loopback only이며

@@ -4,11 +4,23 @@ set -euo pipefail
 # Default Piper command: one managed GPU container owns Warp/PPO, its child
 # TensorBoard, and (when enabled) the four-frame GLFW preview.
 piper_project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-piper_image="${PIPER_RSL_IMAGE:-localhost/piper-rsl:gpu}"
+piper_image="${PIPER_RSL_IMAGE:-}"
+piper_rgb=false
 piper_headless=false
 piper_tensorboard=true
 piper_tensorboard_port=6006
+piper_renderer="${PIPER_RENDERER:-gpu}"
+piper_wsl_root="${PIPER_WSL_ROOT:-/usr/lib/wsl}"
+piper_dxg_device="${PIPER_DXG_DEVICE:-/dev/dxg}"
 piper_help=false
+
+case "$piper_renderer" in
+    gpu|software) ;;
+    *)
+        echo "PIPER_RENDERER must be 'gpu' (default) or 'software' (got '$piper_renderer')." >&2
+        exit 2
+        ;;
+esac
 
 piper_port_is_listening() {
     local piper_port="$1"
@@ -32,6 +44,7 @@ piper_arg=1
 while ((piper_arg <= $#)); do
     piper_value="${!piper_arg}"
     case "$piper_value" in
+        --rgb) piper_rgb=true ;;
         --headless) piper_headless=true ;;
         --no-tensorboard) piper_tensorboard=false ;;
         --tensorboard-port=*) piper_tensorboard_port="${piper_value#--tensorboard-port=}" ;;
@@ -54,6 +67,14 @@ while ((piper_arg <= $#)); do
     esac
     ((piper_arg += 1))
 done
+
+if [[ -z "$piper_image" ]]; then
+    if [[ "$piper_rgb" == true ]]; then
+        piper_image="localhost/piper-rsl:vision"
+    else
+        piper_image="localhost/piper-rsl:gpu"
+    fi
+fi
 
 if [[ ! "$piper_tensorboard_port" =~ ^[0-9]+$ ]] ||
    ((10#$piper_tensorboard_port < 1024 || 10#$piper_tensorboard_port > 65535)); then
@@ -88,8 +109,30 @@ if [[ "$piper_headless" == false ]]; then
         echo "WSLg X11 socket /tmp/.X11-unix/X0 is missing. Reopen WSL or use --headless." >&2
         exit 1
     fi
-    piper_options+=(-e DISPLAY=:0 -e MUJOCO_GL=glfw -e LIBGL_ALWAYS_SOFTWARE=1
-        -v /tmp/.X11-unix:/tmp/.X11-unix:ro)
+    if [[ "$piper_renderer" == gpu ]]; then
+        if [[ ! -e "$piper_dxg_device" ]]; then
+            echo "WSLg GPU device /dev/dxg is missing; use PIPER_RENDERER=software or --headless." >&2
+            exit 1
+        fi
+        if [[ ! -r "$piper_wsl_root/lib/libd3d12.so" || ! -r "$piper_wsl_root/lib/libdxcore.so" ]]; then
+            echo "WSLg GPU libraries /usr/lib/wsl/lib/libd3d12.so and libdxcore.so are missing; " \
+                "use PIPER_RENDERER=software or --headless." >&2
+            exit 1
+        fi
+        piper_options+=(
+            -e DISPLAY=:0 -e MUJOCO_GL=glfw
+            -e GALLIUM_DRIVER=d3d12
+            -e MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
+            -e LD_LIBRARY_PATH=/usr/lib/wsl/lib
+            -v /tmp/.X11-unix:/tmp/.X11-unix:ro
+            -v "$piper_wsl_root:/usr/lib/wsl:ro"
+        )
+    else
+        piper_options+=(
+            -e DISPLAY=:0 -e MUJOCO_GL=glfw -e LIBGL_ALWAYS_SOFTWARE=1
+            -v /tmp/.X11-unix:/tmp/.X11-unix:ro
+        )
+    fi
 fi
 if [[ -t 0 && -t 1 ]]; then piper_options+=(-it); fi
 
