@@ -181,6 +181,27 @@ class PiperPickPlaceTests(unittest.TestCase):
             self.assertTrue(env.has_placed)
             self.assertEqual(env.recontact_penalty_total, 0.0)
 
+            # Stability cannot accumulate on a robot-cube contact tick even
+            # when all placement geometry/release flags look valid.
+            env.reset(seed=5)
+            env.has_lifted = True
+            env.stable_steps = env.settle_steps - 1
+            env._placement_state = lambda: (True, True, True, True)
+            env._robot_cube_contact = lambda: True
+            _, _, terminated, truncated, info = env.step(np.zeros(4))
+            self.assertFalse(terminated or truncated)
+            self.assertEqual(env.stable_steps, 0)
+            self.assertFalse(info["is_success"])
+
+            env._robot_cube_contact = lambda: False
+            for index in range(env.settle_steps):
+                _, _, terminated, truncated, info = env.step(np.zeros(4))
+                if index < env.settle_steps - 1:
+                    self.assertFalse(terminated or truncated)
+            self.assertTrue(terminated)
+            self.assertFalse(truncated)
+            self.assertTrue(info["is_success"])
+
             # Once latched, a recontact costs exactly the configured amount.
             no_contact = PiperPickPlaceEnv()
             with_contact = PiperPickPlaceEnv()

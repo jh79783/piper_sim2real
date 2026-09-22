@@ -1,8 +1,10 @@
 import json
+import io
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -90,6 +92,10 @@ class RslArgumentTests(unittest.TestCase):
         cfg = trainer._make_train_cfg(args, num_obs=OBSERVATION_DIM, num_actions=NUM_ACTIONS)
         self.assertEqual(cfg["actor"]["activation"], "tanh")
         self.assertEqual(cfg["critic"]["activation"], "tanh")
+        self.assertEqual(
+            cfg["actor"]["distribution_cfg"]["class_name"],
+            "scripts.piper_action_distribution:TanhGaussianDistribution",
+        )
         self.assertEqual(cfg["obs_groups"], {"actor": ["policy"], "critic": ["critic"]})
         self.assertAlmostEqual(cfg["algorithm"]["gamma"], 0.99**0.5)
         self.assertAlmostEqual(cfg["algorithm"]["lam"], 0.95**0.5)
@@ -103,6 +109,81 @@ class RslArgumentTests(unittest.TestCase):
             obs_groups={"actor": ["policy", "vision"], "critic": ["critic"]},
         )
         self.assertEqual(cfg["obs_groups"], {"actor": ["policy", "vision"], "critic": ["critic"]})
+
+
+class RslLoggingTests(unittest.TestCase):
+    def test_duration_formatter_keeps_days(self):
+        self.assertEqual(trainer._format_duration(31 * 24 * 60 * 60 + 10 * 60 * 60 + 13 * 60 + 10), "31d 10:13:10")
+        self.assertEqual(trainer._format_duration(10 * 60 * 60 + 13 * 60 + 10), "10:13:10")
+
+    def test_logger_wrapper_rewrites_elapsed_and_eta_without_site_package_patch(self):
+        class FakeLogger:
+            tot_time = 31 * 24 * 60 * 60 + 10 * 60 * 60 + 13 * 60 + 10
+
+            def log(self, **_kwargs):
+                print("Time elapsed: 10:13:10")
+                print("ETA: 10:13:10")
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            trainer._log_iteration_with_day_aware_eta(
+                FakeLogger(),
+                iteration=0,
+                start_iteration=0,
+                total_iterations=100,
+            )
+        rendered = output.getvalue()
+        self.assertIn("Time elapsed: 31d 10:13:10", rendered)
+        self.assertIn("ETA: 3111d 03:43:30", rendered)
+
+    def test_action_diagnostics_keep_dimension_and_temporal_denominators(self):
+        import torch
+
+        sums = torch.tensor([8.0, -8.0, 0.0], dtype=torch.float64)
+        squares = torch.tensor([8.0, 8.0, 0.0], dtype=torch.float64)
+        summary = trainer._summarize_action_diagnostics(
+            sums,
+            squares,
+            action_count=8,
+            temporal_square_sum=torch.tensor(0.0, dtype=torch.float64),
+            temporal_count=16,
+        )
+        self.assertAlmostEqual(summary["action_std"], 0.0, places=9)
+        self.assertEqual(summary["temporal_action_rms"], 0.0)
+        self.assertEqual(summary["temporal_action_denominator"], 16)
+
+    def test_rolling_episode_rate_uses_window_completed_denominator(self):
+        summary = trainer._rolling_episode_diagnostics([(10, 2, 3, 1), (5, 1, 0, 0)])
+        self.assertEqual(summary["completed"], 15)
+        self.assertEqual(summary["success"], 3)
+        self.assertAlmostEqual(summary["success_rate"], 0.2)
+        self.assertEqual(summary["clean_success"], 1)
+        self.assertAlmostEqual(summary["clean_success_rate"], 1 / 15)
+        self.assertAlmostEqual(summary["lift_rate"], 0.2)
+
+    def test_pending_partial_rollout_counts_flush_once_on_interrupt(self):
+        import torch
+
+        state = {
+            "completed_episodes": 7,
+            "success_episodes": 2,
+            "lifted_episodes": 3,
+            "success_contact_anomalies": 0,
+            "_pending_episode_counts": (
+                torch.tensor(4), torch.tensor(1), torch.tensor(2), torch.tensor(1), torch.tensor(1)
+            ),
+            "_pending_counts_committed": False,
+        }
+        self.assertTrue(trainer._flush_pending_episode_counts(state))
+        self.assertEqual(state["completed_episodes"], 11)
+        self.assertEqual(state["success_episodes"], 3)
+        self.assertEqual(state["lifted_episodes"], 5)
+        self.assertEqual(state["success_contact_anomalies"], 1)
+        self.assertEqual(state["clean_success_episodes"], 1)
+        self.assertEqual(state["partial_rollout"]["completed_episodes"], 4)
+        self.assertEqual(state["partial_rollout"]["clean_success_episodes"], 1)
+        self.assertFalse(trainer._flush_pending_episode_counts(state))
+        self.assertEqual(state["completed_episodes"], 11)
 
 
 class RslCheckpointTests(unittest.TestCase):
@@ -123,7 +204,7 @@ class RslCheckpointTests(unittest.TestCase):
         return SimpleNamespace(
             num_actions=NUM_ACTIONS,
             num_observations=OBSERVATION_DIM,
-            reward_version=2,
+            reward_version=3,
             recontact_penalty=0.2,
             frame_skip=10,
             max_episode_length=600,
@@ -132,7 +213,7 @@ class RslCheckpointTests(unittest.TestCase):
             training_config=trainer._make_training_config(args),
             cfg={
                 "observation_version": "policy_critic_sensor_history_v1",
-                "action_semantics": "absolute_joint_targets_v1",
+                "action_semantics": "incremental_joint_targets_v1",
             },
         )
 
@@ -178,10 +259,11 @@ class RslCheckpointTests(unittest.TestCase):
             self.assertEqual(payload["iter"], 3)
             self.assertEqual(payload["infos"]["total_steps"], 2048)
             self.assertEqual(payload["piper_schema"]["num_obs"], OBSERVATION_DIM)
-            self.assertEqual(payload["piper_schema"]["reward_version"], 2)
+            self.assertEqual(payload["piper_schema"]["reward_version"], 3)
             self.assertEqual(payload["piper_schema"]["recontact_penalty"], 0.2)
             self.assertEqual(payload["piper_schema"]["total_steps"], 2048)
-            self.assertEqual(payload["piper_schema"]["schema_version"], 2)
+            self.assertEqual(payload["piper_schema"]["schema_version"], 3)
+            self.assertEqual(payload["piper_schema"]["action_distribution"], "tanh_squashed_gaussian_v1")
             self.assertEqual(payload["piper_schema"]["training_steps"], 0)
             self.assertEqual(payload["infos"]["training_steps"], 0)
             self.assertEqual(payload["piper_schema"]["obs_groups"], {"actor": ["policy"], "critic": ["critic"]})
@@ -203,6 +285,7 @@ class RslCheckpointTests(unittest.TestCase):
             for change, expected_text in (
                 ({"actor_activation": "elu", "critic_activation": "elu"}, "actor_activation"),
                 ({"actor_activation": None}, "actor_activation"),
+                ({"action_distribution": "gaussian_unbounded_v1"}, "action_distribution"),
             ):
                 with self.subTest(change=change):
                     fake_torch = self._FakeTorch()
@@ -211,6 +294,27 @@ class RslCheckpointTests(unittest.TestCase):
                         trainer._load_resume_schema(
                             path, args, env, obs, cfg, torch=fake_torch
                         )
+
+    def test_resume_rejects_schema2_unbounded_gaussian_checkpoint(self):
+        args = trainer.parse_args(["--headless", "--no-tensorboard"])
+        env = self._env()
+        obs = self._obs()
+        cfg = trainer._make_train_cfg(args, num_obs=OBSERVATION_DIM, num_actions=NUM_ACTIONS)
+        expected = trainer._checkpoint_schema(args, env, obs, iteration=0, train_cfg=cfg)
+        fake_torch = self._FakeTorch()
+        fake_torch.payload = {
+            "piper_schema": {
+                **expected,
+                "schema_version": 2,
+                "action_distribution": "gaussian_unbounded_v1",
+            },
+            **self._states(),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "schema2.pt"
+            path.write_bytes(b"placeholder")
+            with self.assertRaisesRegex(ValueError, "schema_version"):
+                trainer._load_resume_schema(path, args, env, obs, cfg, torch=fake_torch)
 
     def test_resume_rejects_old_observation_and_reward_contract(self):
         args = trainer.parse_args(["--headless", "--no-tensorboard"])

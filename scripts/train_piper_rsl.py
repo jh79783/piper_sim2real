@@ -11,8 +11,10 @@ that ``--help`` and argument-validation tests also work on the host machine.
 from __future__ import annotations
 
 import argparse
+from contextlib import redirect_stdout
 from copy import deepcopy
 from datetime import datetime
+import io
 import json
 import math
 import os
@@ -24,12 +26,13 @@ import time
 from typing import Any
 
 
-CHECKPOINT_SCHEMA = 2
+CHECKPOINT_SCHEMA = 3
+ACTION_DISTRIBUTION_CONTRACT = "tanh_squashed_gaussian_v1"
 DEFAULT_OUTPUT_DIR = Path("runs/piper_pick_place")
 DEFAULT_STEPS_PER_ENV = 64
 DEFAULT_ITERATIONS = 10_000
 DEFAULT_TENSORBOARD_PORT = 6006
-EXPECTED_REWARD_VERSION = 2
+EXPECTED_REWARD_VERSION = 3
 EXPECTED_PHYSICS_TIMESTEP = 0.002
 EXPECTED_CONTROL_HZ = 50.0
 EXPECTED_CONTROL_SUBSTEPS = 10
@@ -67,8 +70,8 @@ def _reward_contract(env) -> tuple[int, float]:
     """Return and validate the Piper environment's reward contract.
 
     The reward version is part of the policy/checkpoint contract.  Refusing an
-    older environment here prevents a run from silently mixing reward-v1
-    transitions with the v2 policy metadata.
+    older environment here prevents a run from silently mixing reward-v1/v2
+    transitions with the reward-v3 policy metadata.
     """
 
     missing = [
@@ -79,19 +82,19 @@ def _reward_contract(env) -> tuple[int, float]:
     if missing:
         raise RuntimeError(
             "PiperWarpEnv is missing reward contract field(s) "
-            f"{', '.join(missing)}; use the reward-v2 environment and start a fresh run"
+            f"{', '.join(missing)}; use the reward-v3 environment and start a fresh run"
         )
     reward_version = int(env.reward_version)
     recontact_penalty = float(env.recontact_penalty)
     if reward_version != EXPECTED_REWARD_VERSION:
         raise RuntimeError(
             f"Unsupported Piper reward_version={reward_version}; expected "
-            f"{EXPECTED_REWARD_VERSION}. Start a fresh run with the reward-v2 environment."
+            f"{EXPECTED_REWARD_VERSION}. Start a fresh run with the reward-v3 environment."
         )
     if not math.isfinite(recontact_penalty) or recontact_penalty < 0.0:
         raise RuntimeError(
             f"Unsupported Piper recontact_penalty={recontact_penalty!r}; expected a "
-            "finite non-negative value. Start a fresh run with the reward-v2 environment."
+            "finite non-negative value. Start a fresh run with the reward-v3 environment."
         )
     return reward_version, recontact_penalty
 
@@ -438,9 +441,9 @@ def _terminate_process_group(process, *, timeout: float = 5.0) -> None:
 def start_tensorboard(logdir: Path, port: int):
     """Start one owned TensorBoard process bound to the container interface.
 
-    The Podman wrapper publishes this container port only on host
+    The Docker wrapper publishes this container port only on host
     ``127.0.0.1``.  No process is reused or killed when the requested host port
-    is already occupied; the wrapper rejects that case before Podman starts.
+    is already occupied; the wrapper rejects that case before Docker starts.
     """
 
     command = [
@@ -600,9 +603,9 @@ def _make_train_cfg(args, *, num_obs: int, num_actions: int, obs_groups: dict | 
             "activation": "tanh",
             "obs_normalization": True,
             "distribution_cfg": {
-                "class_name": "rsl_rl.modules.distribution:GaussianDistribution",
+                "class_name": "scripts.piper_action_distribution:TanhGaussianDistribution",
                 "init_std": 1.0,
-                "std_type": "scalar",
+                "std_type": "log",
             },
         },
         "critic": {
@@ -666,6 +669,7 @@ def _checkpoint_schema(
         "actor_obs_dim": observation["actor_obs_dim"],
         "critic_obs_dim": observation["critic_obs_dim"],
         "num_actions": int(env.num_actions),
+        "action_distribution": ACTION_DISTRIBUTION_CONTRACT,
         "reward_version": reward_version,
         "recontact_penalty": recontact_penalty,
         "steps_per_env": int(args.steps_per_env),
@@ -716,6 +720,7 @@ def _load_resume_schema(path: Path, args, env, obs, train_cfg: dict, *, torch):
         "actor_obs_dim",
         "critic_obs_dim",
         "num_actions",
+        "action_distribution",
         "steps_per_env",
         "actor_hidden_dims",
         "critic_hidden_dims",
@@ -740,7 +745,7 @@ def _load_resume_schema(path: Path, args, env, obs, train_cfg: dict, *, torch):
             if key in {"actor_activation", "critic_activation"}:
                 explanation = "the checkpoint predates the tanh MLP schema"
             elif key in {"reward_version", "recontact_penalty"}:
-                explanation = "the checkpoint predates the reward-v2 contract"
+                explanation = "the checkpoint predates the reward-v3 contract"
             raise ValueError(
                 f"Incompatible resume checkpoint: missing {key}; {explanation}; "
                 "start a fresh run"
@@ -845,6 +850,130 @@ def _close_safely(resource):
             print(f"Warning: cleanup failed for {type(resource).__name__}: {exc}", file=sys.stderr)
 
 
+def _format_duration(seconds: float) -> str:
+    """Format elapsed durations without dropping whole days."""
+
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 24 * 60 * 60)
+    hours, seconds = divmod(seconds, 60 * 60)
+    minutes, seconds = divmod(seconds, 60)
+    clock = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{days}d {clock}" if days else clock
+
+
+def _log_iteration_with_day_aware_eta(logger, *, iteration: int, start_iteration: int, total_iterations: int, **kwargs):
+    """Call rsl_rl's logger while retaining days in its console durations.
+
+    rsl_rl 5.0.1 formats both values through ``time.strftime('%H:%M:%S')``;
+    that wraps after 24 hours.  Capturing only the already-formatted console
+    text lets the launcher correct the display without modifying the installed
+    package or changing TensorBoard scalars.
+    """
+
+    rendered = io.StringIO()
+    with redirect_stdout(rendered):
+        logger.log(
+            it=iteration,
+            start_it=start_iteration,
+            total_it=total_iterations,
+            **kwargs,
+        )
+    output = rendered.getvalue()
+    if not output:
+        return
+    elapsed = getattr(logger, "tot_time", None)
+    if elapsed is None:
+        print(output, end="")
+        return
+    done_iterations = iteration + 1 - start_iteration
+    remaining_iterations = total_iterations - start_iteration - done_iterations
+    eta = float(elapsed) / done_iterations * max(0, remaining_iterations) if done_iterations > 0 else 0.0
+    replacements = {
+        "Time elapsed:": _format_duration(float(elapsed)),
+        "ETA:": _format_duration(eta),
+    }
+    lines = output.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        for label, value in replacements.items():
+            marker = label
+            position = line.find(marker)
+            if position < 0:
+                continue
+            ending = "\n" if line.endswith("\n") else ""
+            lines[index] = line[: position + len(marker)] + f" {value}" + ending
+            break
+    print("".join(lines), end="")
+
+
+def _summarize_action_diagnostics(
+    action_sum,
+    action_square_sum,
+    action_count: int,
+    temporal_square_sum,
+    temporal_count: int,
+):
+    """Return bounded policy-target moments without pooling dimensions.
+
+    These values describe normalized policy outputs before actuator target
+    slew limiting; they are not physical actuator velocity statistics.
+    """
+
+    count = max(1, int(action_count))
+    mean = action_sum / count
+    variance = (action_square_sum / count - mean.square()).clamp_min(0.0)
+    return {
+        "action_mean": float(mean.mean().item()),
+        "action_std": float(variance.sqrt().mean().item()),
+        "action_near_boundary_denominator": count,
+        "temporal_action_rms": math.sqrt(float(temporal_square_sum.item()) / max(1, int(temporal_count))),
+        "temporal_action_denominator": int(temporal_count),
+    }
+
+
+def _rolling_episode_diagnostics(window):
+    """Compute success/lift rates over the explicitly bounded update window."""
+
+    completed = sum(int(item[0]) for item in window)
+    success = sum(int(item[1]) for item in window)
+    lifted = sum(int(item[2]) for item in window)
+    clean_success = sum(int(item[3]) for item in window)
+    return {
+        "completed": completed,
+        "success": success,
+        "lifted": lifted,
+        "clean_success": clean_success,
+        "success_rate": success / max(1, completed),
+        "clean_success_rate": clean_success / max(1, completed),
+        "lift_rate": lifted / max(1, completed),
+    }
+
+
+def _flush_pending_episode_counts(state):
+    """Commit a rollout's terminal counts exactly once for interruption safety."""
+
+    pending = state.get("_pending_episode_counts")
+    if pending is None or state.get("_pending_counts_committed", False):
+        return False
+    completed, successes, lifted, anomalies, clean_successes = (
+        int(value.item()) if hasattr(value, "item") else int(value)
+        for value in pending
+    )
+    state["completed_episodes"] = int(state.get("completed_episodes", 0)) + completed
+    state["success_episodes"] = int(state.get("success_episodes", 0)) + successes
+    state["lifted_episodes"] = int(state.get("lifted_episodes", 0)) + lifted
+    state["success_contact_anomalies"] = int(state.get("success_contact_anomalies", 0)) + anomalies
+    state["clean_success_episodes"] = int(state.get("clean_success_episodes", 0)) + clean_successes
+    state["partial_rollout"] = {
+        "completed_episodes": completed,
+        "success_episodes": successes,
+        "lifted_episodes": lifted,
+        "success_contact_anomalies": anomalies,
+        "clean_success_episodes": clean_successes,
+    }
+    state["_pending_counts_committed"] = True
+    return True
+
+
 def _train_iterations(
     runner,
     env,
@@ -871,8 +1000,42 @@ def _train_iterations(
     alg.train_mode()
     logger.init_logging_writer()
     device = torch.device(args.device)
+
+    def commit_episode_counts(completed: int, successes: int, lifted: int, anomalies: int = 0, clean_successes: int = 0):
+        state["completed_episodes"] = int(state.get("completed_episodes", 0)) + int(completed)
+        state["success_episodes"] = int(state.get("success_episodes", 0)) + int(successes)
+        state["lifted_episodes"] = int(state.get("lifted_episodes", 0)) + int(lifted)
+        state["success_contact_anomalies"] = int(state.get("success_contact_anomalies", 0)) + int(anomalies)
+        state["clean_success_episodes"] = int(state.get("clean_success_episodes", 0)) + int(clean_successes)
+        episode_window = list(state.get("episode_window", []))
+        episode_window.append((int(completed), int(successes), int(lifted), int(clean_successes)))
+        state["episode_window"] = episode_window[-20:]
+        state["_pending_counts_committed"] = True
+        return _rolling_episode_diagnostics(state["episode_window"])
+
     for iteration in range(start_iteration, start_iteration + args.iterations):
         collect_started = time.monotonic()
+        action_sum = torch.zeros(int(env.num_actions), dtype=torch.float64, device=device)
+        action_square_sum = torch.zeros(int(env.num_actions), dtype=torch.float64, device=device)
+        action_near_boundary = torch.zeros((), dtype=torch.int64, device=device)
+        action_count = 0
+        temporal_square_sum = torch.zeros((), dtype=torch.float64, device=device)
+        temporal_count = 0
+        previous_actions = None
+        previous_dones = None
+        completed_count = torch.zeros((), dtype=torch.int64, device=device)
+        success_count = torch.zeros((), dtype=torch.int64, device=device)
+        lifted_count = torch.zeros((), dtype=torch.int64, device=device)
+        success_contact_anomaly_count = torch.zeros((), dtype=torch.int64, device=device)
+        clean_success_count = torch.zeros((), dtype=torch.int64, device=device)
+        state["_pending_episode_counts"] = (
+            completed_count,
+            success_count,
+            lifted_count,
+            success_contact_anomaly_count,
+            clean_success_count,
+        )
+        state["_pending_counts_committed"] = False
         for _ in range(args.steps_per_env):
             if state.get("stop_requested", False):
                 break
@@ -883,10 +1046,55 @@ def _train_iterations(
             with torch.inference_mode():
                 actions = alg.act(obs)
                 obs, rewards, dones, infos = env.step(actions.to(env.device))
+                # Bounded normalized policy-target actions, before the
+                # environment's physical actuator slew limiter.
+                executed_actions = actions.detach()
+                executed_float = executed_actions.to(torch.float64)
+                action_sum += executed_float.sum(dim=0)
+                action_square_sum += torch.square(executed_float).sum(dim=0)
+                action_near_boundary += (executed_actions.abs() >= 0.98).sum().to(torch.int64)
+                action_count += int(executed_actions.shape[0])
+                if previous_actions is not None:
+                    valid = ~previous_dones
+                    if valid.any():
+                        temporal_square_sum += torch.square(
+                            executed_float[valid] - previous_actions[valid]
+                        ).sum()
+                        temporal_count += int(valid.sum().item()) * int(env.num_actions)
                 obs = _as_obs_tensordict(obs, device=device)
                 rewards = _to_device(rewards, device)
                 dones = _to_device(dones, device)
                 infos = _normalise_extras(infos, env, device=device)
+                done_mask = dones.to(dtype=torch.bool)
+                completed_count += done_mask.to(torch.int64).sum()
+                success_count += (infos.get("is_success", torch.zeros_like(done_mask)) & done_mask).to(torch.int64).sum()
+                lifted_count += (infos.get("has_lifted", torch.zeros_like(done_mask)) & done_mask).to(torch.int64).sum()
+                success_contact_anomaly_count += (
+                    # ``recontacted`` is episode-history state, so this
+                    # diagnostic is intentionally stricter than instantaneous
+                    # contact at the terminal step.
+                    infos.get("is_success", torch.zeros_like(done_mask))
+                    & done_mask
+                    & (
+                        ~infos.get("has_placed", torch.zeros_like(done_mask))
+                        | infos.get("recontacted", torch.zeros_like(done_mask))
+                    )
+                ).to(torch.int64).sum()
+                clean_success_count += (
+                    infos.get("is_success", torch.zeros_like(done_mask))
+                    & done_mask
+                    & infos.get("has_placed", torch.zeros_like(done_mask))
+                    & ~infos.get("recontacted", torch.zeros_like(done_mask))
+                ).to(torch.int64).sum()
+                state["_pending_episode_counts"] = (
+                    completed_count,
+                    success_count,
+                    lifted_count,
+                    success_contact_anomaly_count,
+                    clean_success_count,
+                )
+                previous_actions = executed_float
+                previous_dones = done_mask
                 check_nan(obs, rewards, dones)
                 alg.process_env_step(obs, rewards, dones, infos)
             logger.process_env_step(rewards, dones, infos)
@@ -906,6 +1114,9 @@ def _train_iterations(
                     # env renderer first, then this owned window/context.
                     viewer.disable()
         if state.get("stop_requested", False):
+            # Preserve terminal counts from a rollout interrupted by a window
+            # close before PPO update/checkpoint handling returns control.
+            _flush_pending_episode_counts(state)
             break
         collect_time = time.monotonic() - collect_started
         with torch.inference_mode():
@@ -913,16 +1124,60 @@ def _train_iterations(
         learn_started = time.monotonic()
         loss_dict = alg.update()
         learn_time = time.monotonic() - learn_started
-        logger.log(
-            it=iteration,
-            start_it=start_iteration,
-            total_it=start_iteration + args.iterations,
+        _log_iteration_with_day_aware_eta(
+            logger,
+            iteration=iteration,
+            start_iteration=start_iteration,
+            total_iterations=start_iteration + args.iterations,
             collect_time=collect_time,
             learn_time=learn_time,
             loss_dict=loss_dict,
             learning_rate=alg.learning_rate,
             action_std=alg.get_policy().output_std,
             rnd_weight=None,
+        )
+        completed = int(completed_count.item())
+        successes = int(success_count.item())
+        lifted = int(lifted_count.item())
+        success_contact_anomalies = int(success_contact_anomaly_count.item())
+        clean_successes = int(clean_success_count.item())
+        # Commit once per complete PPO update. The early-stop path above
+        # commits the partial rollout before returning to checkpoint logic.
+        rolling = commit_episode_counts(completed, successes, lifted, success_contact_anomalies, clean_successes)
+        action_diagnostics = _summarize_action_diagnostics(
+            action_sum,
+            action_square_sum,
+            action_count,
+            temporal_square_sum,
+            temporal_count,
+        )
+        writer = getattr(logger, "writer", None)
+        if writer is not None:
+            action_denominator = max(1, action_count * int(env.num_actions))
+            writer.add_scalar("Perf/policy_action_near_boundary_fraction", float(action_near_boundary.item()) / action_denominator, iteration)
+            writer.add_scalar("Perf/policy_action_mean", action_diagnostics["action_mean"], iteration)
+            writer.add_scalar("Perf/policy_action_std", action_diagnostics["action_std"], iteration)
+            writer.add_scalar("Perf/policy_temporal_action_rms", action_diagnostics["temporal_action_rms"], iteration)
+            writer.add_scalar("Perf/policy_temporal_action_denominator", action_diagnostics["temporal_action_denominator"], iteration)
+            writer.add_scalar("Episode/completed_count", completed, iteration)
+            writer.add_scalar("Episode/success_count", successes, iteration)
+            writer.add_scalar("Episode/lifted_count", lifted, iteration)
+            writer.add_scalar("Episode/success_contact_anomaly_count", success_contact_anomalies, iteration)
+            writer.add_scalar("Episode/clean_success_count", clean_successes, iteration)
+            writer.add_scalar("Episode/rolling_completed_count", rolling["completed"], iteration)
+            writer.add_scalar("Episode/rolling_success_denominator", rolling["completed"], iteration)
+            writer.add_scalar("Episode/rolling_success_rate", rolling["success_rate"], iteration)
+            writer.add_scalar("Episode/rolling_clean_success_denominator", rolling["completed"], iteration)
+            writer.add_scalar("Episode/rolling_clean_success_rate", rolling["clean_success_rate"], iteration)
+            writer.add_scalar("Episode/rolling_lift_rate", rolling["lift_rate"], iteration)
+        print(
+            "Episode metrics (last 20 updates): "
+            f"completed={rolling['completed']} success={rolling['success']} "
+            f"clean_success={rolling['clean_success']} lifted={rolling['lifted']} "
+            f"success_rate={rolling['success_rate']:.4f} "
+            f"clean_success_rate={rolling['clean_success_rate']:.4f} "
+            f"lift_rate={rolling['lift_rate']:.4f}",
+            flush=True,
         )
         # RSL-RL's built-in runner records the last completed zero-based
         # iteration. Keep this value current for both periodic and interrupted
@@ -949,13 +1204,13 @@ def main(argv=None) -> int:
         raise RuntimeError("CPU execution is unsupported: this task requires CUDA MuJoCo Warp + RSL-RL")
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "CUDA is unavailable. Run scripts/run_piper_pick_place.sh with the NVIDIA Podman device; "
+            "CUDA is unavailable. Run scripts/run_piper_pick_place.sh with Docker GPU support (--gpus all); "
             "CPU fallback is intentionally disabled."
         )
 
     def _handle_termination(_signum, _frame):
         # Convert container stop/SIGTERM into the same checkpointing path as
-        # Ctrl+C. Podman --init still reaps any child that exits unexpectedly.
+        # Ctrl+C. Docker --init still reaps any child that exits unexpectedly.
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _handle_termination)
@@ -1000,6 +1255,12 @@ def main(argv=None) -> int:
         "stop_requested": False,
         "window_stop_requested": False,
         "completed": False,
+        "completed_episodes": 0,
+        "success_episodes": 0,
+        "lifted_episodes": 0,
+        "success_contact_anomalies": 0,
+        "clean_success_episodes": 0,
+        "episode_window": [],
     }
     preview_frames = 0
     resume_payload_hint = None
@@ -1112,7 +1373,18 @@ def main(argv=None) -> int:
         if not args.headless:
             from scripts.viewer_grid import GridWindow, PreviewController
 
-            viewer = PreviewController(GridWindow(), args.fps, total_envs=env.num_envs)
+            if args.rgb:
+                # The RGB policy renderer owns MuJoCo's EGL backend.  Keep the
+                # visible GLFW preview in a child process so EGL and GLX never
+                # contend for one MuJoCo process-global context.
+                viewer = PreviewController.isolated(
+                    args.fps,
+                    total_envs=env.num_envs,
+                    software=os.environ.get("PIPER_PREVIEW_SOFTWARE") == "1",
+                    wslg=os.environ.get("PIPER_PREVIEW_WSLG") == "1",
+                )
+            else:
+                viewer = PreviewController(GridWindow(), args.fps, total_envs=env.num_envs)
             if not viewer.maybe_draw(_render_frames(env), 0, str(env.device)):
                 state["stop_requested"] = True
                 state["window_stop_requested"] = True
@@ -1188,6 +1460,9 @@ def main(argv=None) -> int:
         status = "error"
         raise
     finally:
+        # A KeyboardInterrupt can arrive inside a rollout before the normal
+        # iteration commit; preserve those terminal counts in the summary.
+        _flush_pending_episode_counts(state)
         # Save the latest complete PPO state even when the user interrupted
         # between updates. A partial rollout is intentionally not optimized.
         if resume_checkpoint_ready and runner is not None and latest_obs is not None and train_cfg is not None:
@@ -1213,7 +1488,7 @@ def main(argv=None) -> int:
                 checkpoint_error = exc
                 status = "error"
                 print(f"Warning: final checkpoint save failed: {exc}", file=sys.stderr, flush=True)
-        preview_frames = viewer.window.frames_drawn if viewer is not None else 0
+        preview_frames = viewer.frames_drawn if viewer is not None else 0
         try:
             if runner is not None and getattr(runner, "logger", None) is not None:
                 logger = runner.logger
@@ -1238,6 +1513,7 @@ def main(argv=None) -> int:
                 finally:
                     _terminate_process_group(tb_process)
         summary_training_steps = int(state.get("training_steps", 0))
+        summary_rgb_timing = None
         if env is not None:
             try:
                 summary_training_steps = _env_training_steps(env)
@@ -1245,6 +1521,12 @@ def main(argv=None) -> int:
                 # Preserve the original training failure if an environment
                 # died before it could expose its progress counter.
                 pass
+            try:
+                timing = getattr(env, "render_timing", None)
+                if isinstance(timing, dict):
+                    summary_rgb_timing = _jsonable(timing)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                summary_rgb_timing = None
         summary = {
             "status": status,
             "task": "piper_pick_place",
@@ -1264,6 +1546,16 @@ def main(argv=None) -> int:
             "tensorboard_port": args.tensorboard_port if not args.no_tensorboard else None,
             "preview_frames": preview_frames,
             "checkpoint_saved": checkpoint_saved,
+            "rgb_timing": summary_rgb_timing,
+            "episode_metrics": {
+                "completed_episodes": int(state.get("completed_episodes", 0)),
+                "success_episodes": int(state.get("success_episodes", 0)),
+                "lifted_episodes": int(state.get("lifted_episodes", 0)),
+                "success_contact_anomalies": int(state.get("success_contact_anomalies", 0)),
+                "clean_success_episodes": int(state.get("clean_success_episodes", 0)),
+                "partial_rollout": state.get("partial_rollout"),
+                "rolling": _rolling_episode_diagnostics(state.get("episode_window", [])),
+            },
         }
         (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
         if status != "error" and checkpoint_saved:

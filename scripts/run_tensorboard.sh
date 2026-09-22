@@ -2,7 +2,7 @@
 set -euo pipefail
 
 piper_project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-piper_image="${PIPER_RSL_IMAGE:-${PIPER_RL_IMAGE:-localhost/piper-rsl:gpu}}"
+piper_image="${PIPER_RSL_IMAGE:-${PIPER_RL_IMAGE:-piper-rsl:gpu}}"
 piper_port="${1:-6006}"
 if [[ "${1:-}" == "--port" ]]; then piper_port="${2:-}"; fi
 if [[ "${1:-}" == --port=* ]]; then piper_port="${1#--port=}"; fi
@@ -35,7 +35,7 @@ if piper_port_is_listening "$piper_port"; then
 fi
 mkdir -p "$piper_project_dir/runs"
 echo "TensorBoard: http://localhost:$piper_port (Ctrl+C to stop)"
-exec podman run --rm --init --userns=keep-id --security-opt=label=disable \
+exec docker run --rm --init --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -p "127.0.0.1:$piper_port:6006" \
     -v "$piper_project_dir/runs:/logs:ro" \
     "$piper_image" \

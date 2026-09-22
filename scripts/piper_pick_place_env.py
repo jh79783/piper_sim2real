@@ -16,6 +16,15 @@ def build_model():
     robot_dir = PROJECT_ROOT / "third_party/mujoco_menagerie/agilex_piper"
     root = ET.parse(robot_dir / "piper.xml").getroot()
     root.find("compiler").set("meshdir", str(robot_dir / "assets"))
+    # The policy RGB camera is a rigid child of the existing Menagerie link6
+    # body.  Keep the Menagerie robot XML untouched and generate only the
+    # lightweight, visual-only D455 representation here.
+    from scripts.piper_camera import make_d455_wrist_body
+
+    wrist = root.find(".//body[@name='link6']")
+    if wrist is None:
+        raise RuntimeError("Menagerie Piper model is missing the link6 wrist body")
+    wrist.append(make_d455_wrist_body())
     # The original keyframe does not include the new object's free joint.
     for keyframes in root.findall("keyframe"):
         root.remove(keyframes)
@@ -33,7 +42,7 @@ def build_model():
 
 class PiperPickPlaceEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 25}
-    reward_version = 2
+    reward_version = 3
     recontact_penalty = 0.2
     cube_half_size = 0.02
     goal_half_size = np.array([0.06, 0.05])
@@ -302,7 +311,7 @@ class PiperPickPlaceEnv(gym.Env):
             self.recontact_penalty_total += self.recontact_penalty
         release_gate = self.has_lifted and inside and on_table and released and not robot_contact
         self.has_placed = self.has_placed or release_gate
-        valid_place = self.has_lifted and inside and on_table and still and released
+        valid_place = release_gate and still
         self.stable_steps = self.stable_steps + 1 if valid_place else 0
         success = self.stable_steps >= self.settle_steps
         failed = self.cube_position[2] < -0.025 or np.linalg.norm(self.cube_position[:2]) > 0.75

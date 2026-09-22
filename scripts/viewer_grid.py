@@ -8,6 +8,9 @@ text overlays; it does not step any physics here.
 
 from __future__ import annotations
 
+import multiprocessing as mp
+import os
+import queue
 import time
 
 
@@ -71,12 +74,12 @@ class GridWindow:
         self._closed = False
         self._window_closed = False
         if not glfw.init():
-            raise RuntimeError("GLFW initialization failed: check DISPLAY and the WSLg X11 mount")
+            raise RuntimeError("GLFW initialization failed: check DISPLAY, the X11 socket, and XAUTHORITY")
         try:
             glfw.window_hint(glfw.VISIBLE, glfw.TRUE)
             self.window = glfw.create_window(width, height, f"{title} | 2x2 | Esc: save and exit", None, None)
             if not self.window:
-                raise RuntimeError("Could not open the WSLg preview window")
+                raise RuntimeError("Could not open the X11 preview window")
             glfw.make_context_current(self.window)
             glfw.swap_interval(0)
             # This empty model provides a valid MuJoCo OpenGL drawing context;
@@ -188,10 +191,119 @@ class PreviewController:
         self.interval = 1.0 / fps
         self.last_draw = float("-inf")
         self.last_grid = None
+        self.frames_drawn = 0
+        self._isolated_process = None
+        self._frame_queue = None
+        self._event_queue = None
+        self._child_closed = False
+
+    @classmethod
+    def isolated(
+        cls,
+        fps: float,
+        *,
+        total_envs: int | None = None,
+        software: bool = False,
+        wslg: bool = False,
+    ):
+        """Create a preview child with its own GLFW backend.
+
+        The training process may already own MuJoCo's EGL context for the RGB
+        policy.  GLFW must therefore initialize in a fresh process; a bounded
+        one-frame queue keeps a slow or closed window from stalling rollout.
+        """
+
+        if fps <= 0:
+            raise ValueError("fps must be greater than zero")
+        result = cls.__new__(cls)
+        result.window = None
+        result.total_envs = total_envs
+        result.disabled = False
+        result.interval = 1.0 / fps
+        result.last_draw = float("-inf")
+        result.last_grid = None
+        result.frames_drawn = 0
+        result._child_closed = False
+        context = mp.get_context("spawn")
+        result._frame_queue = context.Queue(maxsize=1)
+        result._event_queue = context.Queue(maxsize=4)
+        result._isolated_process = context.Process(
+            target=_isolated_preview_worker,
+            args=(result._frame_queue, result._event_queue, total_envs, software, wslg),
+            daemon=True,
+        )
+        result._isolated_process.start()
+        result._child_ready = False
+        result._child_error = None
+        result._wait_for_child_ready(timeout=5.0)
+        return result
+
+    def _wait_for_child_ready(self, *, timeout: float) -> None:
+        if self._event_queue is None or self._isolated_process is None:
+            raise RuntimeError("isolated preview process was not created")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._drain_child_events()
+            if self._child_ready:
+                return
+            if self._child_closed or not self._isolated_process.is_alive():
+                detail = getattr(self, "_child_error", None)
+                self.close()
+                raise RuntimeError(detail or "isolated preview process exited during startup")
+            time.sleep(0.01)
+        self.close()
+        raise RuntimeError("isolated preview process did not initialize within 5 seconds")
+
+    def _drain_child_events(self) -> None:
+        if self._event_queue is None:
+            return
+        while True:
+            try:
+                event, detail = self._event_queue.get_nowait()
+            except queue.Empty:
+                return
+            if event == "ready":
+                self._child_ready = True
+            elif event == "drawn":
+                self.frames_drawn += 1
+            elif event in {"closed", "error"}:
+                self._child_closed = True
+                if event == "error" and detail:
+                    # Keep the error available to the parent caller without
+                    # making the GUI child a second training logger.
+                    self._child_error = str(detail)
+
+    def _enqueue_latest(self, message) -> bool:
+        if self._frame_queue is None or self._isolated_process is None:
+            return False
+        if not self._isolated_process.is_alive() or self._child_closed:
+            return False
+        try:
+            self._frame_queue.put_nowait(message)
+            return True
+        except queue.Full:
+            try:
+                self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._frame_queue.put_nowait(message)
+                return True
+            except queue.Full:
+                # A slow preview is allowed to skip a frame. The caller must
+                # continue training while the one-slot queue catches up.
+                return True
 
     def poll(self) -> bool:
         if self.disabled:
             return True
+        if self._isolated_process is not None:
+            self._drain_child_events()
+            if getattr(self, "_child_error", None):
+                detail = self._child_error
+                self._child_error = None
+                raise RuntimeError(f"preview child failed: {detail}")
+            return not self._child_closed and self._isolated_process.is_alive()
         return self.window.poll()
 
     def maybe_draw(self, frames, steps: int, device: str) -> bool:
@@ -200,18 +312,112 @@ class PreviewController:
         now = time.monotonic()
         if now - self.last_draw < self.interval:
             return True
+        if self._isolated_process is not None:
+            frames = _as_rgb_frames(frames)
+            if not self._enqueue_latest((frames, int(steps), str(device))):
+                return False
+            self.last_grid = make_grid(frames)
+            self.last_draw = now
+            return self.poll()
         if not self.window.draw(frames, steps, device, total_envs=self.total_envs):
             return False
         self.last_draw = now
         self.last_grid = make_grid(_as_rgb_frames(frames))
+        self.frames_drawn = self.window.frames_drawn
         return True
 
     def close(self):
+        if self._isolated_process is not None or self._frame_queue is not None:
+            self._drain_child_events()
+            if self._frame_queue is not None:
+                for _ in range(2):
+                    try:
+                        self._frame_queue.put_nowait(None)
+                        break
+                    except queue.Full:
+                        try:
+                            self._frame_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                    except AttributeError:
+                        break
+            self._isolated_process.join(timeout=2.0)
+            if self._isolated_process.is_alive():
+                self._isolated_process.terminate()
+                self._isolated_process.join(timeout=2.0)
+            self._isolated_process = None
+            for channel in (self._frame_queue, self._event_queue):
+                cancel = getattr(channel, "cancel_join_thread", None)
+                if callable(cancel):
+                    cancel()
+                close = getattr(channel, "close", None)
+                if callable(close):
+                    close()
+            self._frame_queue = None
+            self._event_queue = None
+            return
+        if self.window is None:
+            return
         self.window.close()
 
     def disable(self):
         """Turn off preview while retaining ownership for orderly final close."""
 
         if not self.disabled:
-            self.window.close_window()
+            if self._isolated_process is not None:
+                self.close()
+            else:
+                self.window.close_window()
         self.disabled = True
+
+
+def _isolated_preview_worker(frame_queue, event_queue, total_envs, software, wslg):
+    """Display RGB frames in a process whose first GL backend is GLFW."""
+
+    # These assignments must precede the local GLFW/MuJoCo imports.  The
+    # parent may have initialized MuJoCo's EGL backend for policy rendering.
+    os.environ["MUJOCO_GL"] = "glfw"
+    if software:
+        os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    if wslg and not software:
+        os.environ["GALLIUM_DRIVER"] = "d3d12"
+        os.environ["MESA_D3D12_DEFAULT_ADAPTER_NAME"] = "NVIDIA"
+        os.environ["LD_LIBRARY_PATH"] = "/usr/lib/wsl/lib"
+    window = None
+
+    def send_event(event, detail=None):
+        try:
+            event_queue.put_nowait((event, detail))
+        except queue.Full:
+            # Draw acknowledgements are advisory. Preserve terminal events by
+            # dropping one stale acknowledgement if the event queue is full.
+            if event in {"closed", "error"}:
+                try:
+                    event_queue.get_nowait()
+                    event_queue.put_nowait((event, detail))
+                except (queue.Empty, queue.Full):
+                    pass
+
+    try:
+        window = GridWindow()
+        send_event("ready")
+        while True:
+            if not window.poll():
+                send_event("closed")
+                return
+            try:
+                message = frame_queue.get(timeout=0.02)
+            except queue.Empty:
+                continue
+            if message is None:
+                return
+            frames, steps, device = message
+            if not window.draw(frames, steps, device, total_envs=total_envs):
+                send_event("closed")
+                return
+            send_event("drawn")
+    except BaseException as exc:  # pragma: no cover - backend/display dependent
+        send_event("error", f"{type(exc).__name__}: {exc}")
+    finally:
+        if window is not None:
+            window.close()

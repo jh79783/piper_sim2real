@@ -26,15 +26,15 @@ class PiperTrainingConfig:
     domain_randomization: bool = True
     sensor_noise: bool = True
     curriculum: bool = True
-    # MuJoCo advances at 2 ms.  The policy emits one direct joint target every
-    # 20 ms (50 Hz), hence ten physics substeps per environment transition.
+    # MuJoCo advances at 2 ms.  The policy emits one incremental joint-target
+    # command every 20 ms (50 Hz), hence ten physics substeps per transition.
     physics_timestep: float = 0.002
     control_hz: int = 50
     decimation: int = 10
     episode_seconds: float = 12.0
     success_seconds: float = 0.32
-    # Direct target action contract.  The six arm values are normalized to
-    # each joint range; the seventh is normalized to the gripper opening.
+    # Incremental target action contract. Six arm values are normalized target
+    # increments and the seventh is a normalized gripper-target increment.
     num_actions: int = 7
     joint_target_rate: float = 0.035
     gripper_target_rate: float = 0.004

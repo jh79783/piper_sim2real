@@ -48,7 +48,7 @@ def run(worlds: int, steps: int) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("Torch CUDA is unavailable; expose an NVIDIA GPU to the container")
     if not wp.is_cuda_available():
-        raise RuntimeError("Warp CUDA is unavailable; check the NVIDIA driver/CDI runtime")
+        raise RuntimeError("Warp CUDA is unavailable; check the NVIDIA driver and Docker GPU support (--gpus all)")
     if worlds < 1 or steps < 1:
         raise ValueError("worlds and steps must be positive")
 

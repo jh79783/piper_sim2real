@@ -27,11 +27,12 @@ def _policy_and_critic(env):
     return observations["policy"], observations["critic"]
 
 
-def _direct_target_action(env, destination, aperture):
-    """Convert a TCP target to the env's seven direct-target action.
+def _incremental_target_action(env, destination, aperture):
+    """Convert a TCP target to the env's seven incremental-target action.
 
-    The conversion is deliberately test-only.  The rollout environment must
-    consume absolute joint targets directly and must not run Cartesian IK.
+    The conversion is deliberately test-only. The rollout environment still
+    must not run Cartesian IK; this helper only turns the desired joint target
+    into one bounded actuator-target increment for the physics oracle.
     """
 
     current = _cpu(env._qpos[:, env._arm_qadr][0])
@@ -40,13 +41,11 @@ def _direct_target_action(env, destination, aperture):
     )
     if residual > 0.01:
         raise AssertionError(f"test-side reset IK failed: residual={residual:.4f} m")
-    low = _cpu(env._joint_low)
-    high = _cpu(env._joint_high)
-    mid = 0.5 * (low + high)
-    half = 0.5 * (high - low)
+    previous = _cpu(env._ctrl[:, env._arm_actuators][0])
     action = np.empty((1, env.num_actions), dtype=np.float32)
-    action[0, :6] = np.clip((target - mid) / half, -1.0, 1.0)
-    action[0, 6] = np.clip(2.0 * float(aperture) / 0.035 - 1.0, -1.0, 1.0)
+    action[0, :6] = np.clip((target - previous) / env.joint_target_rate, -1.0, 1.0)
+    previous_gripper = float(_cpu(env._ctrl[:, env.gripper_actuator][0]))
+    action[0, 6] = np.clip((float(aperture) - previous_gripper) / env.gripper_scale, -1.0, 1.0)
     return torch.as_tensor(action, device=env.device)
 
 
@@ -207,7 +206,7 @@ class PiperWarpTests(unittest.TestCase):
         self.assertEqual(env.episode_length_buf[1].item(), 0)
         self.assertIn("log", extras)
 
-    def test_direct_action_mapping_and_slew_are_joint_space(self):
+    def test_incremental_action_mapping_and_slew_are_joint_space(self):
         env = self.env
         env.reset(seed=11)
         start = env._ctrl[:, env._arm_actuators].detach().clone()
@@ -340,14 +339,66 @@ class PiperWarpTests(unittest.TestCase):
             reset_prev = env._last_actions.detach().clone()
             hold = reset_prev.clone()
             _, hold_reward, _, _ = env.step(hold)
-            _, jump_reward, _, _ = env.step(-hold)
+            jump = torch.ones_like(hold)
+            _, jump_reward, _, _ = env.step(jump)
             self.assertGreater(hold_reward.item(), jump_reward.item())
-            expected = env._stage.action_rate_weight * torch.square(-hold - hold).sum()
+            expected = env._stage.action_rate_weight * torch.square(jump - hold).sum()
             self.assertAlmostEqual(
                 jump_reward.item(),
                 hold_reward.item() - expected.item(),
                 places=4,
             )
+        finally:
+            env.close()
+
+    def test_robot_contact_cannot_start_or_continue_success_stability(self):
+        """Reward-v3 requires every stable tick to remain contact-free."""
+
+        env = PiperWarpEnv(
+            num_envs=1,
+            device="cuda:0",
+            seed=16,
+            start_mode="above_cube",
+            training_config=PiperTrainingConfig(
+                domain_randomization=False,
+                sensor_noise=False,
+                curriculum=False,
+                time_penalty=0.0,
+            ),
+        )
+        try:
+            env.reset(seed=16)
+            env._step_physics = lambda: None
+            env._check_physics_state = lambda: None
+            env._finger_contacts = lambda: torch.zeros(
+                (1, 2), dtype=torch.bool, device=env.device
+            )
+            env._placement_state = lambda: tuple(
+                torch.ones(1, dtype=torch.bool, device=env.device) for _ in range(4)
+            )
+            env._potential = lambda: torch.zeros(1, dtype=torch.float32, device=env.device)
+            env.has_lifted[:] = True
+            env.stable_steps[:] = env.settle_steps - 1
+            env._robot_cube_contacts = lambda: torch.ones(
+                1, dtype=torch.bool, device=env.device
+            )
+
+            _, _, done, extras = env.step(torch.zeros((1, env.num_actions), device=env.device))
+            self.assertFalse(done.item())
+            self.assertEqual(env.stable_steps.item(), 0)
+            self.assertFalse(extras["is_success"].item())
+
+            env._robot_cube_contacts = lambda: torch.zeros(
+                1, dtype=torch.bool, device=env.device
+            )
+            for index in range(env.settle_steps):
+                _, _, done, extras = env.step(
+                    torch.zeros((1, env.num_actions), device=env.device)
+                )
+                if index < env.settle_steps - 1:
+                    self.assertFalse(done.item())
+            self.assertTrue(done.item())
+            self.assertTrue(extras["is_success"].item())
         finally:
             env.close()
 
@@ -375,7 +426,7 @@ class PiperWarpTests(unittest.TestCase):
 
             def drive(destination, aperture, count):
                 for _ in range(count):
-                    action = _direct_target_action(
+                    action = _incremental_target_action(
                         env,
                         destination[0].detach().cpu().numpy(),
                         aperture,

@@ -19,30 +19,66 @@ git submodule update --init third_party/mujoco_menagerie
 
 [Piper real2sim 비교와 IMU·BAM 검토](docs/piper_real2sim_reference_comparison.md)에서
 초기 구현과 현재 구성, 실기 적용 시 필요한 작업을 확인할 수 있습니다.
+[관절 command/feedback trace와 offline replay](docs/piper_real2sim_reference_comparison.md#관절-명령피드백-trace와-오프라인-replay)는
+실기 명령을 보내지 않고 MOVEJ 기록을 검증하는 절차를 설명합니다.
 [학습 robustness 설정](docs/piper_training_robustness.md)에는 50Hz 시간 기준,
 물리·센서 randomization, curriculum stage와 checkpoint 조건을 정리했습니다.
+
+## Docker 준비 및 이미지 빌드
+
+학습은 Docker 컨테이너에서 실행합니다. Linux Docker Engine에서는 NVIDIA
+드라이버와 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)이
+필요하며, Docker Desktop for Windows에서는
+[WSL 2 GPU 지원](https://docs.docker.com/desktop/features/gpu/)을 설정하세요.
+현재 사용자로 `docker info`가 성공해야 하며, 다음 명령으로 컨테이너의 GPU 접근을 확인합니다.
+
+```bash
+docker run --rm --gpus all ubuntu:24.04 nvidia-smi
+```
+
+프로젝트 루트에서 아래 순서대로 빌드합니다. `Dockerfile`은 legacy Reacher용
+`piper-rl:gpu`를 만들고, `Dockerfile.rsl`은 이를 기반으로 Piper용
+`piper-rsl:gpu`를 만듭니다. 기본 Docker builder를 사용해 같은 Docker Engine에
+이미지를 빌드하세요.
+
+```bash
+docker build -t piper-rl:gpu -f Dockerfile .
+docker build -t piper-rsl:gpu -f Dockerfile.rsl .
+
+# RGB 정책을 사용할 때만 추가 빌드
+docker build -t piper-rsl:vision -f Dockerfile.vision .
+```
+
+GPU 학습 스크립트는 `--gpus all`로 GPU를 연결하고 호스트 UID/GID로 실행하므로
+`runs/`와 `.cache/`에 생성한 파일도 현재 사용자 소유입니다. 컨테이너의
+`HOME`은 쓰기 가능한 `/tmp`이고, 학습 캐시는 프로젝트의 `.cache/`에 보존합니다.
+학습 코드와 모델은 `/workspace`에 마운트하므로 코드 변경 시 재빌드는 필요하지 않습니다.
+`PIPER_RSL_IMAGE`와 `PIPER_RL_IMAGE`로 사용할 이미지 태그를 바꿀 수 있습니다.
+
+미리보기 창은 호스트의 `DISPLAY`와 해당 X11 socket을 사용합니다. Docker
+컨테이너에는 선택한 display cookie만 담은 임시 read-only Xauthority 파일을
+마운트하므로 `xhost+`가 필요하지 않습니다. WSLg `:0`과 native/Xrdp display
+`:10` 같은 local display를 지원하며, 화면이 없으면 `--headless`를 사용하세요.
 
 ## Piper pick-and-place (기본 실행)
 
 기본 학습 과제는 MuJoCo Warp GPU 물리와 `rsl_rl` 5.0.1 PPO를 사용하는
-Piper arm pick-and-place입니다. WSL Ubuntu의 관리형 Podman 이미지
-`localhost/piper-rsl:gpu`를 프로젝트에 마운트해 실행합니다.
+Piper arm pick-and-place입니다. Docker 이미지 `piper-rsl:gpu`에 프로젝트를
+마운트해 실행합니다.
 Actor와 critic MLP의 기본 activation은 `tanh`이며, 이전 ELU 설정으로 만든
 checkpoint는 호환되지 않으므로 새 학습을 시작해야 합니다. 현재 기본 경로는
 물리 `0.002 s × 10`의 50Hz, 600 policy tick (12초)이며, 초기 25Hz/300-tick
-Piper checkpoint와 schema 2 이전 checkpoint는 호환되지 않습니다. 정책은 7차원
-normalized direct joint/gripper target을 내고, 63차원 state/action-history를
+Piper checkpoint와 schema 3 이전 checkpoint는 호환되지 않습니다. 정책은 7차원
+normalized incremental joint/gripper target command를 내고, 63차원 state/action-history를
 사용합니다. actor에는 noisy/delayed sensor state, critic에는 clean observation을
 제공하며 둘 다 empirical normalization을 켭니다. 스크립트 변경만으로 적용되므로
 이미지 재빌드는 필요하지 않습니다.
 
-이미지가 없다면 다음처럼 한 번 빌드합니다. 기존 `Containerfile`과
-`localhost/piper-rl:gpu` 이미지는 legacy Reacher 경로를 위해 보존됩니다.
-
-```bash
-podman build -t localhost/piper-rl:gpu -f Containerfile .
-podman build -t localhost/piper-rsl:gpu -f Containerfile.rsl .
-```
+Incremental action에서 zero는 현재 actuator target을 유지하는 hold command입니다.
+처음 6개 값은 기존 joint target rate (`0.035 rad/tick`)의 배수이고 마지막 값은
+기존 gripper rate (`0.004 m/tick`)의 배수입니다. 적용 target은 기존 joint limit와
+gripper limit 안에서 clamp됩니다. SDK/저수준 제어기에 absolute target을 보내는
+변환은 학습 정책 contract 바깥의 별도 adapter가 담당해야 합니다.
 
 ```bash
 cd /home/mjung11/workspace/piper_sim2real
@@ -50,7 +86,7 @@ bash scripts/run_piper_pick_place.sh
 ```
 
 한 명령으로 CUDA GPU Warp 환경 128개, 하나의 PPO 정책, 그리고 실제 학습
-환경 ID 0–3을 합친 하나의 2×2 WSLg 창이 시작됩니다. TensorBoard도 같은
+환경 ID 0–3을 합친 하나의 2×2 preview 창이 시작됩니다. TensorBoard도 같은
 컨테이너의 소유 child로 시작하며 주소는 기본적으로
 [http://localhost:6006](http://localhost:6006)입니다. 호스트
 `127.0.0.1`에만 바인딩되고, 포트 충돌 시 기존 프로세스를 건드리지 않고
@@ -69,7 +105,7 @@ bash scripts/run_piper_pick_place.sh --tensorboard-port 6007
 bash scripts/run_piper_pick_place.sh --headless --num-envs 64 --steps-per-env 64 --iterations 10 \
     --tensorboard-port 16006
 
-# 호환 가능한 schema-2 RSL-RL .pt 재개 / fixed home pose 변형
+# 호환 가능한 schema-3 RSL-RL .pt 재개 / fixed home pose 변형
 bash scripts/run_piper_pick_place.sh --resume runs/piper_pick_place/<run>/model.pt
 bash scripts/run_piper_pick_place.sh --start-mode home
 
@@ -98,23 +134,36 @@ Observation은 63차원이며, 앞의 56개 state field 뒤에 직전 7차원 ra
 유지됩니다. 그 뒤 cube가 goal 밖으로 움직이더라도 latch는 유지되며, 이후
 contact가 감지된 control step에만 0.2의 `recontact_penalty`를 적용합니다.
 따라서 접촉이 없는 남은 step 전체에 매번 penalty를 주는 것은 아닙니다.
-이는 full-task `task/success_rate` 정의를 바꾸지 않는 reward-v2 동작입니다.
+이는 full-task `task/success_rate` 정의를 바꾸지 않는 reward-v3 동작입니다. 성공 안정
+카운트는 lift, goal 내부, table 위, gripper release, robot-cube 비접촉을 모두 만족한
+control tick에서만 시작하고, 이후 16개의 연속된 비접촉·정지 tick이 필요합니다.
 `task/recontact_rate`와 episode의 양의 누적 비용인 `task/recontact_penalty`를
 함께 확인하세요. 현재 계수는 검증용 설정이며 최적 benchmark라고 주장하지 않습니다.
-기존 reward-v1 또는 58차원 run의 reward/return은 새 run과 직접 비교하지 말고,
+기존 reward-v1/v2 또는 58차원 run의 reward/return은 새 run과 직접 비교하지 말고,
 `--resume` 없이 새 학습을 시작하세요.
 
 첫 실행은 Warp CUDA kernel compile으로 잠시 지연될 수 있으며 cache는
 `.cache/warp`에 보존됩니다. 학습 물리와 PPO는 GPU에서 실행되며, episode
-초기화용 IK helper는 CPU를 사용할 수 있습니다. GUI는 기본적으로 WSLg D3D12
-GPU rendering을 사용하며, `PIPER_RENDERER=software bash scripts/run_piper_pick_place.sh`
-로 명시적인 software fallback을 선택할 수 있습니다. GPU GUI 모드에서 필요한
-`/dev/dxg` 또는 `/usr/lib/wsl/lib` 라이브러리가 없으면 wrapper가 조용히 CPU로
-전환하지 않고 오류를 냅니다. `--headless`는 WSLg graphics checks를 건너뜁니다.
+초기화용 IK helper는 CPU를 사용할 수 있습니다. RGB 정책의 GUI 실행은
+GPU EGL 정책 renderer를 유지하고, 작은 child process가 GLFW preview 창만
+담당합니다. `PIPER_RENDERER=gpu`는 native/WSLg accelerated preview를
+사용하고, `PIPER_RENDERER=software`는 preview child만 software GLFW로
+실행합니다. State-only GUI는 하나의 GLFW backend를 사용합니다. 필요한
+GPU backend가 없으면 wrapper가 조용히 CPU로 전환하지 않고 오류를 냅니다.
+`--headless`는 preview와 X11 checks를 건너뛰고 RGB 정책을 EGL로 실행합니다.
 rollout physics를 CPU에서 별도로 step하지 않습니다. Esc, 창 닫기, Ctrl+C는
 checkpoint, summary, 환경, TensorBoard child를 정리합니다. `--device cpu`는 지원하지 않으며
 CUDA가 없으면 hard error입니다. 이 코드는 simulation 검증용이고 실제
 Piper/CAN/motor 명령을 보내지 않습니다.
+
+RGB actor observation contract v2는 55차원 numeric state와 frozen 4096차원
+vision feature를 사용합니다. Base state의 cube XYZ와 이를 직접 재구성하는
+cube-minus-TCP/goal-minus-cube 세 그룹만 actor에서 제외하고, orientation·velocity·
+contact·lift·placement·time·command·previous action fields는 유지합니다. retained
+fields는 설계상 간접적인 object cue를 제공할 수 있습니다. 따라서
+RGB actor 입력은 4151차원이고 critic은 기존 clean 63차원을 유지합니다. v1 RGB
+PPO checkpoint는 새 actor observation과 호환되지 않아 새 학습이 필요하며,
+standalone frozen encoder는 재사용할 수 있습니다.
 
 기본 설정은 `10,000 × 128 × 64 ≈ 81.9M` transitions이므로 긴 학습입니다.
 먼저 위의 bounded smoke 명령으로 설치와 reset/metric 경로를 확인하세요.
@@ -127,7 +176,7 @@ GUI 사용 시 `preview.png`. TensorBoard에서 `task/success_rate` (full-task),
 Reward만으로 과제 성공을 판단하지 마세요.
 
 종료 후 로그를 보려면 standalone helper를 사용합니다. 역시 loopback only이며
-임의의 서버에 붙거나 broad Podman cleanup을 하지 않습니다.
+임의의 서버에 붙거나 다른 Docker 컨테이너를 정리하지 않습니다.
 
 ```bash
 bash scripts/run_tensorboard.sh

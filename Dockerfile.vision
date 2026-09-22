@@ -1,0 +1,18 @@
+# Optional simulated-vision derivative.  Keep the existing GPU simulation
+# image as the source of torch/CUDA and add only the pretrained RGB encoder.
+FROM piper-rsl:gpu
+
+ENV MUJOCO_GL=egl \
+    HF_HOME=/workspace/.cache/huggingface
+
+COPY requirements-vision.txt /tmp/requirements-vision.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements-vision.txt
+
+# Docker's GPU hook can mount the NVIDIA EGL libraries without installing
+# their GLVND vendor descriptor. Register them so headless RGB rendering can
+# discover the GPU instead of selecting Mesa's software renderer.
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+    && printf '%s\n' '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}}' \
+    > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+
+WORKDIR /workspace

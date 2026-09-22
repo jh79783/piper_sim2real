@@ -1,6 +1,6 @@
-# GPU/RSL-RL dependency set for the derivative localhost/piper-rsl:gpu image.
+# GPU/RSL-RL dependency set for the derivative piper-rsl:gpu image.
 #
-# The base image supplies the CUDA build of PyTorch 2.10.0.  Containerfile.rsl
+# The base image supplies the CUDA build of PyTorch 2.10.0.  Dockerfile.rsl
 # installs torchvision 0.25.0 from the matching cu128 index before installing
 # this file; keeping those two packages out of this list prevents pip from
 # replacing the CUDA wheels with a CPU wheel from the default index.

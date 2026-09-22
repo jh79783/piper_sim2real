@@ -30,6 +30,7 @@ _POOL_SIZE = (4, 4)
 _FEATURE_SHAPE = (256, 4, 4)
 _MEAN = (0.5, 0.5, 0.5)
 _STD = (0.5, 0.5, 0.5)
+_ENCODE_CHUNK_SIZE = 64
 
 
 def _load_timm():
@@ -199,12 +200,14 @@ class RGBFeatureEncoder(nn.Module):
                     f"expected {value!r}, got {metadata.get(key)!r}"
                 )
 
-    def preprocess(self, rgb: Tensor) -> Tensor:
+    def preprocess(self, rgb: Tensor, *, device: torch.device | str | None = None) -> Tensor:
         """Center-crop an HWC uint8 RGB batch and resize it to 128×128.
 
         A single ``[H, W, 3]`` frame is accepted as a convenience and is
         promoted to a batch.  The return value is NCHW float in ``[0, 1]``;
-        model normalization is applied by :meth:`encode`.
+        model normalization is applied by :meth:`encode`.  ``device`` is an
+        internal fast path used by :meth:`encode`; leaving it unset preserves
+        the CPU behavior expected by offline callers and unit tests.
         """
 
         if not isinstance(rgb, Tensor):
@@ -218,6 +221,8 @@ class RGBFeatureEncoder(nn.Module):
                 "RGB input must have shape [H, W, 3] or [N, H, W, 3], "
                 f"got {tuple(rgb.shape)}"
             )
+        if device is not None:
+            rgb = rgb.to(device=device, non_blocking=True)
         height, width = int(rgb.shape[1]), int(rgb.shape[2])
         if height < 1 or width < 1:
             raise ValueError("RGB input height and width must be positive")
@@ -237,12 +242,37 @@ class RGBFeatureEncoder(nn.Module):
     def encode(self, rgb: Tensor) -> Tensor:
         """Encode uint8 RGB frame(s) into frozen 4096-D CUDA/CPU features."""
 
-        tensor = self.preprocess(rgb)
+        if not isinstance(rgb, Tensor):
+            rgb = torch.as_tensor(rgb)
+        if rgb.ndim == 3:
+            rgb = rgb.unsqueeze(0)
+        if rgb.ndim != 4 or rgb.shape[-1] != 3:
+            raise ValueError(
+                "RGB input must have shape [H, W, 3] or [N, H, W, 3], "
+                f"got {tuple(rgb.shape)}"
+            )
+        if rgb.dtype != torch.uint8:
+            raise TypeError(f"RGB input must be uint8, got {rgb.dtype}")
         parameter = next(self.parameters())
-        tensor = tensor.to(device=parameter.device)
+        batch_size = int(rgb.shape[0])
+        if batch_size == 0:
+            return torch.empty((0, self.feature_dim), dtype=torch.float32, device=parameter.device)
+        preprocessed_chunks = []
+        for start in range(0, batch_size, _ENCODE_CHUNK_SIZE):
+            preprocessed_chunks.append(
+                self.preprocess(
+                    rgb[start : start + _ENCODE_CHUNK_SIZE],
+                    device=parameter.device,
+                )
+            )
+        # Keep the frozen CNN's original full-batch shape.  Only the expensive
+        # raw-image transfer/crop/resize is chunked; concatenating 128x128
+        # tensors here preserves the established CUDA convolution path and its
+        # numerical behavior while using bounded temporary preprocessing memory.
+        tensor = torch.cat(preprocessed_chunks, dim=0)
         tensor = (tensor - self.normalization_mean) / self.normalization_std
-        features = self.pool(self.encoder(tensor))
-        return features.flatten(1)
+        features = self.pool(self.encoder(tensor)).flatten(1)
+        return features
 
     def forward(self, rgb: Tensor) -> Tensor:
         return self.encode(rgb)

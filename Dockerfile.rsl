@@ -1,9 +1,9 @@
 # RSL-RL + MuJoCo-Warp derivative image.
 #
-# Keep Containerfile and localhost/piper-rl:gpu untouched.  The existing image
-# already contains Ubuntu 24.04/Python 3.12 and torch 2.10.0+cu128, so this
+# Build Dockerfile as piper-rl:gpu first.  The base image
+# contains Ubuntu 24.04/Python 3.12 and torch 2.10.0+cu128, so this
 # derivative only replaces SB3 and adds the direct MuJoCo-Warp/RSL stack.
-FROM localhost/piper-rl:gpu
+FROM piper-rl:gpu
 
 ENV PYTHONUNBUFFERED=1
 

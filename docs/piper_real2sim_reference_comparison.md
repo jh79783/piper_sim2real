@@ -39,7 +39,7 @@ Piper의 실측 데이터를 시뮬레이션에 반영하는 real2sim과, 시뮬
 | --- | --- | --- |
 | 물리·정책 주기 | 물리 `0.002 s × 10`, 정책 50Hz | 초기 CPU 환경은 25Hz (`×20`)로 유지 |
 | 에피소드·안정 판정 | 600 정책 tick (12s), 16 tick (0.32s) | 정책 tick 기준이며 Warp 물리 substep은 별도 |
-| 행동 | 7차원 normalized direct target | 6개 관절 target은 joint-limit midpoint/half-span으로 decode하고 2mrad margin·tick별 slew를 적용 |
+| 행동 | 7차원 normalized incremental target command | 6개 관절 command는 기존 actuator target에 `0.035 rad/tick` increment를 더하고, gripper는 `0.004 m/tick` increment를 더한 뒤 기존 limit를 적용 |
 | 관측 | 63차원: 56차원 raw-SI state + 7차원 previous raw action | actor는 sensor state 오차·지연 관측, critic은 같은 63차원의 clean 관측 |
 | 관측 정규화 | actor·critic empirical normalization | critic의 clean 입력은 학습용이며 실기 센서 경로를 뜻하지 않음 |
 | 물리 randomization | world별 episode마다 링크·cube 질량/관성/COM, table/cube/finger 마찰 | 보수적 불확실성 범위이며 Piper 측정값이 아님 |
@@ -54,6 +54,102 @@ actor 관측에 접촉·상태 flag 등 시뮬레이터에서 계산한 값이 �
 
 구체적인 CLI toggle, stage 값, checkpoint 호환성은 [학습 robustness 문서](piper_training_robustness.md)를
 참조한다.
+
+## 관절 명령·피드백 trace와 오프라인 replay
+
+실기에서 첫 비교를 시작할 때는 CAN 클라이언트를 이 저장소에서 새로 만들지 않고,
+검증된 ROS 2 제어 노드의 **수동 subscriber**로 `sensor_msgs/JointState`를 기록한다.
+현재 AgxArm 노드에서 MOVEJ 명령 topic은 `/control/move_j`, 관절 피드백 topic은
+`/feedback/joint_states`다. `scripts/piper_motion_trace.py`의
+`Ros2JointStateRecorder`는 두 topic을 subscribe만 하며 publish, enable, pyAgxArm
+getter 호출, motor/CAN 명령을 실행하지 않는다. `/control/joint_states`,
+`/control/move_js`, `/control/move_p`, `/control/move_l`, `/control/move_c`,
+`/control/move_mit`가 관찰되면 이후 MOVEJ까지 trace command를 invalid로 표시한다.
+첫 bounded 측정은
+MOVEJ만 사용해야 하며, 누락된 관절 이름을 0으로 채우지 않는다.
+
+Trace는 versioned JSONL이다. 각 sample은 monotonic capture timestamp, 여섯 개
+absolute joint target/feedback (SI rad), optional full gripper opening (SI m), source
+timestamp, source name, validity를 가진다. 학습 정책의 normalized incremental action을
+그대로 기록하지 말고, 실제 controller에 보낸 absolute target을 기록한다. SDK·ROS의
+`0.001 degree` 값은 `millidegree_to_rad()`로, full opening `µm`은
+`micrometer_full_opening_to_model_half_travel()`로 변환한다. 모델의 gripper joint는
+한쪽 half travel이므로 full opening을 절반으로 바꾸며, 임의의 clipping은 하지 않는다.
+
+수동 record integration은 다음처럼 구성한다. 이 예시는 command를 보내지 않으며,
+실제 ROS node가 이미 생성한 `node`와 검증된 callback/spin 수명주기를 사용한다.
+
+```python
+from scripts.piper_motion_trace import Ros2JointStateRecorder, TraceWriter
+
+writer = TraceWriter(
+    "runs/motion/arm.jsonl",
+    metadata={
+        "controller": {"mode": "MOVEJ", "speed_percent": 30, "pub_rate_hz": 100},
+        "firmware": {"version": "record-from-device"},
+        # ROS header time and local monotonic capture time are not assumed equal.
+        "source_timestamps_comparable": False,
+    },
+)
+recorder = Ros2JointStateRecorder(node=node, writer=writer)
+```
+
+ROS 2 환경에서는 별도 publisher 없이 다음 passive recorder를 실행할 수도 있다.
+이 명령은 `rclpy.spin_once`로 두 topic을 읽고, `Ctrl-C` 또는 duration 종료 시
+JSONL을 닫는다. `--speed-percent`와 `--publisher-rate-hz`는 trace metadata로만
+기록되며 controller parameter를 바꾸지 않는다.
+
+```bash
+python3 scripts/piper_motion_trace.py record-ros runs/motion/movej.jsonl \
+  --duration-s 30 --controller-mode MOVEJ-only \
+  --speed-percent 30 --publisher-rate-hz 100 \
+  --firmware-version "record-from-device"
+```
+
+실제 launch에서 auto-enable, `move_home`, teach mode, 다른 command publisher를
+끄고 정지한 상태에서 시작하며, bounded MOVEJ 구간만 포함한다. recorder는
+`/control/joint_states`도 unsupported command로 감시하므로, 그것이나 pose/MOVEJS/MIT
+topic이 섞인 trace는 replay 전에 invalid로 거부된다.
+
+호스트나 managed image에서 trace 구조를 먼저 확인하고, 그 다음 existing Piper
+CPU MuJoCo model로 replay할 수 있다.
+
+```bash
+python3 scripts/piper_motion_trace.py validate runs/motion/arm.jsonl \
+  --output runs/motion/arm.validation.json
+python3 scripts/piper_motion_trace.py replay runs/motion/arm.jsonl \
+  --output runs/motion/arm.replay.json
+# 관절 응답만 볼 때 task geometry contact를 명시적으로 끄는 선택지
+python3 scripts/piper_motion_trace.py replay runs/motion/arm.jsonl \
+  --contact-free --output runs/motion/arm.contact_free.replay.json
+```
+
+Replay는 첫 valid joint feedback으로만 초기 `qpos`를 한 번 설정하고, 이후에는
+초기 `qvel=0`을 가정하며 feedback을 simulator state로 쓰지 않는다. 첫 bounded
+측정은 정지한 pose에서 시작해야 하며, 주행 중인 trace의 첫 feedback을 초기화 값으로
+사용하면 초기 속도 오차를 분리할 수 없다. 기록된 absolute command를 zero-order hold로
+유지하면서 model timestep마다 `mj_step`하고, feedback에 대한 joint별 MAE/RMSE/max
+absolute error를 낸다. 기본 replay는 training scene의 cube/table/goal geometry와
+contact를 그대로 유지한다. 순수 관절 응답 bench에서 task geometry가 우연히 닿는 것을
+피하려면 `--contact-free`를 명시할 수 있으며, 이 경우 report의
+`scene_mode=contact_free_non_robot_geometry_collisions_disabled`와 disabled geom 수를
+확인한다. 로봇 body의 gravcomp, actuator gain/bias, force range, timestep은 두 mode에서
+바꾸지 않는다. ROS callback 사이의 jitter는 nominal full step 뒤 positive
+fractional step으로 시간량을 보존하며 command target은 만료되지 않고 다음 command까지
+hold한다. MuJoCo model metadata에는 timestep, gravity, integrator/solver
+옵션, arm actuator gain/bias/force range, robot body `gravcomp`, joint/model gripper
+범위가 함께 저장된다. source clock domain이 비교 불가능한 ROS trace는 replay하되
+report에 `source_timestamp_alignment=not_comparable`와 stale detection 비활성화를
+명시한다. comparable한 clock에서는 stale source timestamp를, ROS adapter에서는
+node clock이 있을 때 stale를 검사하고, 모든 mode에서 zero·out-of-order·duplicate·
+non-finite timestamp와 target/model 범위 불일치를 trace invalid/reject한다. 어느 경우에도
+조용히 clip하지 않는다.
+
+이 replay는 기존 training model의 중력 보상과 position actuator를 그대로 사용하는
+응답 비교 도구다. synthetic fixture의 zero error는 실기 calibration이나 sim2real
+성공 증거가 아니며, gain·friction·speed scaling을 자동 fitting하지 않는다. 실제
+측정 전에는 CAN/ROS command publisher를 실행하지 말고, MOVEJ 한 종류·낮은 속도·
+구속된 안전 조건의 기록 계획을 별도로 검토해야 한다.
 
 근거: [현재 학습 설정](../scripts/train_piper_rsl.py),
 [현재 Warp 환경](../scripts/piper_warp_env.py), [실행 안내](../README.md).

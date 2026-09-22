@@ -2,7 +2,7 @@
 set -euo pipefail
 
 piper_project_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-piper_image="${PIPER_RL_IMAGE:-localhost/piper-rl:gpu}"
+piper_image="${PIPER_RL_IMAGE:-piper-rl:gpu}"
 piper_headless=false
 piper_device=cuda
 for ((piper_arg=1; piper_arg<=$#; piper_arg++)); do
@@ -22,11 +22,13 @@ for ((piper_arg=1; piper_arg<=$#; piper_arg++)); do
     esac
 done
 
-piper_options=(--rm --init --userns=keep-id --security-opt=label=disable
+mkdir -p "$piper_project_dir/.cache"
+piper_options=(--rm --init --user "$(id -u):$(id -g)"
+    -e HOME=/tmp -e XDG_CACHE_HOME=/workspace/.cache
     -e OMP_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 -e MKL_NUM_THREADS=1
     -v "$piper_project_dir:/workspace" -w /workspace)
 if [[ "$piper_device" == cuda ]]; then
-    piper_options+=(--device nvidia.com/gpu=all)
+    piper_options+=(--gpus all)
 fi
 if [[ "$piper_headless" == false ]]; then
     if [[ ! -S /tmp/.X11-unix/X0 ]]; then
@@ -38,5 +40,5 @@ if [[ "$piper_headless" == false ]]; then
 fi
 if [[ -t 0 && -t 1 ]]; then piper_options+=(-it); fi
 
-exec podman run "${piper_options[@]}" "$piper_image" \
+exec docker run "${piper_options[@]}" "$piper_image" \
     python -m scripts.train_reacher_parallel "$@"

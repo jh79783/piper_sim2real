@@ -11,12 +11,13 @@ Warp 물리 timestep은 `0.002 s`이고 policy가 10개의 물리 step마다 act
 결정하므로 기본 주기는 50Hz다. 한 episode는 600 policy tick, 즉 12초이며,
 유효한 배치가 16 tick (0.32초) 지속되어야 성공으로 기록된다. 25Hz 초기 CPU
 환경의 `0.002 s × 20`과 기존 300 tick checkpoint는 이 시간 기준과 다르다.
-policy action은 7차원 normalized direct target이다. 처음 6개 값은 각 관절의
-joint-limit midpoint/half-span으로 decode한 뒤 2mrad margin 안에서 적용하고,
-tick별 최대 slew는 `0.035 rad`로 제한한다. 마지막 gripper 값은 `0..0.035 m`
-opening target로 decode하고 tick별 최대 변화량은 `0.004 m`이다. 50Hz에서
-평균 관절 속도가 초기 25Hz 경로와 크게 달라지지 않도록 tick별 이동 제한은
-초기 정책 tick 제한의 절반 수준으로 둔다.
+policy action은 7차원 normalized incremental target command다. zero action은
+현재 actuator target을 유지한다. 처음 6개 값은 각 관절 target에 더하는
+`0.035 rad/tick` increment이고 마지막 값은 gripper target에 더하는
+`0.004 m/tick` increment다. 결과 target은 기존 joint/gripper limits 안에서
+clamp한다. SDK/저수준 제어기에 absolute target을 보내는 변환은 학습 정책
+contract 바깥의 별도 adapter다. 50Hz에서 평균 관절 속도가 초기 25Hz 경로와
+크게 달라지지 않도록 tick별 이동 제한은 초기 정책 tick 제한의 절반 수준으로 둔다.
 PPO는 이 control tick 기준으로 `gamma=sqrt(0.99)`, `lambda=sqrt(0.95)`를
 사용한다. 따라서 discount와 GAE horizon도 25Hz에서 유지하던 physical-time
 비율을 기준으로 조정된다.
@@ -100,9 +101,9 @@ weight와 home-start 비율도 이 표의 step 경계에서 함께 바뀐다.
 와 `home`은 `--start-mode`로 직접 선택할 수 있다. 명시한 start mode는 curriculum의
 home probability보다 우선하며, mode를 지정하지 않는 기본 경로에서만 stage의
 home probability를 사용한다. action-rate penalty는 policy가 낸 현재 raw action과
-관측에 포함된 직전 raw action의 차이에 적용한다. reset 시 직전 action은 reset 때 실제로 쓴 normalized
-joint/gripper command로 초기화하므로, reset pose를 그대로 유지하는 첫 tick에는
-변화 penalty가 없다.
+관측에 포함된 직전 raw action의 차이에 적용한다. reset 시 직전 incremental action은
+zero로 초기화하므로, zero command는 reset target을 유지하고 첫 tick의 변화 penalty가
+없다.
 
 ## 실행과 checkpoint
 
@@ -122,10 +123,22 @@ bash scripts/run_piper_pick_place.sh --headless --start-mode home
 ```
 
 checkpoint에는 `training_steps`가 저장되며 resume 시 curriculum stage가 그
-값에서 이어진다. 새 checkpoint schema는 `2`다. 25Hz/300-tick 초기 경로의
+값에서 이어진다. 새 checkpoint schema는 `3`이며 `tanh_squashed_gaussian_v1`
+action distribution, incremental action contract, reward-v3 placement gate를 포함한다.
+25Hz/300-tick 초기 경로의
 checkpoint와 SB3 `.zip`, 이전 observation layout 또는 다른 actor/critic 입력을
 가진 `.pt`는 호환되지 않으므로 새 run을 시작해야 한다. checkpoint 호환 여부는
 단순히 파일 확장자가 아니라 schema와 시간/관측 설정을 함께 확인해 판단한다.
+
+reward-v3에서는 성공 stability가 `has_lifted`, goal 내부, table 위, release,
+robot-cube 비접촉을 같은 tick에 만족한 뒤 시작한다. 이후에도 robot-cube contact가
+한 tick이라도 발생하면 stability가 0으로 돌아가며, 16개의 연속된 접촉 없는 정지
+tick을 다시 채워야 한다. TensorBoard의 `Episode/success_count`는 기존 full-task
+성공을, `Episode/success_contact_anomaly_count`는 placement/recontact 조건을
+위반한 성공 신호를, `Episode/clean_success_count`는 보수적인 성공 수를 기록한다.
+`Episode/rolling_*_denominator`와 함께 읽어 빈 terminal batch를 성공률 0으로
+오해하지 않도록 한다. reward-v1/v2 checkpoint는 새 reward contract와 호환되지
+않으므로 normal resume를 거부한다.
 
 ## 해석 범위
 

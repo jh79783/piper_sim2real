@@ -227,7 +227,7 @@ def main(argv=None):
     args = parse_args(argv)
     torch.set_num_threads(1)
     if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA unavailable. Run with --device nvidia.com/gpu=all in Podman; "
+        raise RuntimeError("CUDA unavailable. Run with --gpus all in Docker; "
                            "or explicitly select --device cpu for a CPU-only test.")
 
     # A unique directory preserves earlier runs, models and TensorBoard logs.

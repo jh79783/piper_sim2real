@@ -1,10 +1,11 @@
 """Optional RGB policy wrapper for the GPU Piper vector environment.
 
 The base :class:`PiperWarpEnv` remains the source of physics, rewards, resets,
-and the clean critic observation.  This wrapper owns only a low-resolution
-MuJoCo renderer and a frozen RGB encoder.  It samples images at 30 Hz while
-the policy continues to step at 50 Hz, reusing the latest feature map and
-reporting its age in seconds.
+and the clean critic observation.  This wrapper owns a 640x480 MuJoCo wrist
+camera renderer and a frozen RGB encoder.  It samples images at 30 Hz while
+the policy continues to step at 50 Hz, center-crops the raw frame to the
+existing 128x128 encoder input, reuses the latest feature map, and reports its
+age in seconds.
 
 The encoder module is intentionally imported lazily.  The concrete
 ``RGBFeatureEncoder`` and ``create_rgb_feature_encoder`` API keeps the
@@ -14,6 +15,7 @@ optional vision dependency out of state-only help and training paths.
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Iterable
 
 
@@ -21,22 +23,70 @@ class PiperRGBEnv:
     """Wrap a working ``PiperWarpEnv`` with frozen RGB policy features."""
 
     num_actions = 7
-    num_observations = 36
+    num_observations = 55
     num_critic_observations = 63
-    observation_version = "rgb_resnetv2_front10_v1"
+    observation_version = "rgb_resnetv2_wrist_d455_object_xyz_hidden_v2"
 
-    # The base state is deliberately sliced to exclude exact cube, velocity,
-    # contact, lift, and placement fields from the RGB actor.  ``vision`` is a
-    # separate CHW 256x4x4 feature map flattened only at the MLP boundary.
+    # Hide absolute cube XYZ and the two direct position differences that
+    # reconstruct it. Retain every other base policy field (orientation,
+    # velocity, contact, lift, placement, time, commands, and action history)
+    # so direct object XYZ paths are omitted while the remaining state
+    # contract stays unchanged. Other retained fields may provide indirect
+    # cues by design. ``vision`` is a separate CHW 256x4x4 map.
     _POLICY_SLICES = (
-        slice(0, 17),    # joint/finger proprioception and gripper target
+        slice(0, 20),    # joint/finger state, TCP, and gripper target
+        slice(23, 33),   # cube orientation and velocity
         slice(36, 39),   # known goal command
-        slice(42, 44),   # known goal half-size
-        slice(49, 55),   # applied arm command
-        slice(56, 63),   # previous raw action
+        slice(42, 63),   # goal size, contact/progress, commands, action history
     )
     vision_feature_shape = (256, 4, 4)
     vision_feature_dim = 4 * 4 * 256
+
+    # MuJoCo's visual scene update for this Piper model consumes only these
+    # pose arrays.  Keeping the list explicit is important: mujoco_warp's
+    # generic get_data_into() converts every q/constraint/solver array to the
+    # host for each world, although the renderer never reads those arrays.
+    _RENDER_SNAPSHOT_FIELDS = (
+        "geom_xpos",
+        "geom_xmat",
+        "site_xpos",
+        "site_xmat",
+        "cam_xpos",
+        "cam_xmat",
+        "light_xpos",
+        "light_xdir",
+    )
+    # The snapshot is deliberately specialized to the compiled Piper scene
+    # used by the RGB policy.  Keep this contract explicit so a future model
+    # edit cannot silently render stale/unpopulated state through the fast
+    # path.  The generic MuJoCo-Warp transfer remains the fallback for other
+    # scenes in callers that need one.
+    _RENDER_MODEL_COUNTS = {
+        "nbody": 15,
+        "ngeom": 94,
+        "nsite": 6,
+        "ncam": 1,
+        "nlight": 2,
+        "nq": 15,
+        "nv": 14,
+        "nu": 7,
+        "nmocap": 1,
+        "neq": 1,
+        "nflex": 0,
+        "nskin": 0,
+        "ntendon": 0,
+        "nsensor": 0,
+        "nplugin": 0,
+    }
+    # MuJoCo 3.10.0's MjvOption defaults.  These defaults leave visual
+    # geoms/sites enabled while all renderer-decor paths that would consume
+    # additional MjData fields remain disabled for this scene.
+    _RENDER_DEFAULT_FLAGS = (
+        False, True, False, False, False, False, False, True,
+        True, False, False, False, False, True, False, False,
+        False, False, False, False, False, False, True, True,
+        False, True, False, True, False, False, False,
+    )
 
     def __init__(
         self,
@@ -58,7 +108,7 @@ class PiperRGBEnv:
         self.num_envs = int(base_env.num_envs)
         self.num_actions = int(base_env.num_actions)
         if self.num_actions != 7:
-            raise ValueError("RGB Piper policy requires the seven direct joint-target actions")
+            raise ValueError("RGB Piper policy requires the seven incremental joint-target actions")
         self.device = base_env.device
         self.model = base_env.model
         self.frame_skip = int(base_env.frame_skip)
@@ -72,6 +122,9 @@ class PiperRGBEnv:
         self.start_mode = base_env.start_mode
         self.camera_fps = float(camera_fps)
         self.image_size = (int(image_size[0]), int(image_size[1]))
+        from scripts.piper_camera import POLICY_RENDER_SIZE
+
+        self.camera_render_size = tuple(int(value) for value in POLICY_RENDER_SIZE)
         self.control_hz = 1.0 / (float(self.model.opt.timestep) * self.frame_skip)
         self.control_period = 1.0 / self.control_hz
         self._capture_phase = 0.0
@@ -80,6 +133,21 @@ class PiperRGBEnv:
         self._camera = None
         self._render_option = None
         self._closed = False
+        self._render_timing = {
+            "render_calls": 0,
+            "render_frames": 0,
+            "render_field_transfers": 0,
+            "render_transfer_seconds": 0.0,
+            "render_seconds": 0.0,
+            "encode_calls": 0,
+            "encode_frames": 0,
+            # This is host dispatch time only.  The frozen CUDA encoder may
+            # still be executing after the call returns; callers that need a
+            # device-runtime measurement must synchronize or use CUDA events
+            # around their benchmark rather than treating this as full GPU
+            # execution time.
+            "encode_host_dispatch_seconds": 0.0,
+        }
 
         checkpoint_vision = self._checkpoint_vision_config(encoder_checkpoint)
         self.encoder = encoder if encoder is not None else self._build_encoder(
@@ -96,8 +164,9 @@ class PiperRGBEnv:
         self.vision_config = self._make_vision_config(checkpoint_vision)
         if checkpoint_vision is not None and self.vision_config != checkpoint_vision:
             raise ValueError(
-                "RGB checkpoint encoder metadata does not match the constructed encoder; "
-                "refusing to resume with a different feature contract"
+                "RGB checkpoint camera/encoder metadata does not match the constructed "
+                "wrist-D455 observation contract; refusing to resume with a different "
+                "feature contract"
             )
         if encoder_checkpoint is not None:
             state = encoder_checkpoint.get("vision_encoder_state_dict")
@@ -117,12 +186,13 @@ class PiperRGBEnv:
                 "num_obs": self.num_observations,
                 "num_critic_obs": self.num_critic_observations,
                 "num_actions": self.num_actions,
-                "action_semantics": self.cfg.get("action_semantics", "absolute_joint_targets_v1"),
+                "action_semantics": self.cfg.get("action_semantics", "incremental_joint_targets_v1"),
                 "observation_version": self.observation_version,
                 "obs_groups": {"actor": ["policy", "vision"], "critic": ["critic"]},
                 "vision_config": self.vision_config,
                 "camera_fps": self.camera_fps,
                 "camera_image_size": list(self.image_size),
+                "camera_render_size": list(self.camera_render_size),
             }
         )
 
@@ -145,6 +215,13 @@ class PiperRGBEnv:
         schema = checkpoint.get("piper_schema")
         if not isinstance(schema, dict):
             raise ValueError("RGB checkpoint has no piper_schema")
+        observation_version = schema.get("observation_version")
+        if observation_version != PiperRGBEnv.observation_version:
+            raise ValueError(
+                "RGB checkpoint observation_version is incompatible with the current "
+                f"wrist-D455 actor contract: expected {PiperRGBEnv.observation_version!r}, "
+                f"got {observation_version!r}; start a fresh RGB PPO run"
+            )
         metadata = schema.get("vision_config")
         if metadata is None:
             raise ValueError("RGB resume requires a checkpoint with vision_config metadata")
@@ -183,6 +260,8 @@ class PiperRGBEnv:
                 parameter.requires_grad_(False)
 
     def _make_vision_config(self, checkpoint_config):
+        from scripts.piper_camera import camera_metadata
+
         metadata = getattr(self.encoder, "metadata", None)
         if callable(metadata):
             metadata = metadata()
@@ -219,6 +298,7 @@ class PiperRGBEnv:
                 "camera_fps": self.camera_fps,
                 "camera_name": "policy_rgb",
                 "preprocessing": "RGBFeatureEncoder.preprocess",
+                "camera_config": camera_metadata(),
             }
         )
         if tuple(result["feature_shape"]) != self.vision_feature_shape:
@@ -227,6 +307,10 @@ class PiperRGBEnv:
             raise ValueError("RGB encoder feature_dim must be 4096")
         if tuple(result["image_size"]) != self.image_size:
             raise ValueError("RGB encoder image_size differs from the renderer contract")
+        if tuple(result["camera_config"]["render_resolution"]) != self.camera_render_size:
+            raise ValueError("D455 camera render resolution differs from the renderer contract")
+        if float(result["camera_config"]["native_fov_deg"]["vertical"]) != 65.0:
+            raise ValueError("D455 camera vertical field of view must remain 65 degrees")
         if checkpoint_config is not None:
             # The checkpoint metadata is authoritative for resume validation;
             # compare the complete mapping after normalizing tuple/list forms.
@@ -249,35 +333,161 @@ class PiperRGBEnv:
         if self._renderer is not None:
             return
         mujoco = self.base_env._mujoco
-        width, height = self.image_size
+        self._render_option = mujoco.MjvOption()
+        # D455 RGB sees visual geometry only.  The model's group-3 collision
+        # proxies are useful to physics and the free preview but must not
+        # leak into the policy observation.
+        self._render_option.geomgroup[3] = 0
+        self._verify_render_contract(mujoco)
+        width, height = self.camera_render_size
         self._renderer = mujoco.Renderer(self.model, height=height, width=width)
         self._render_data = mujoco.MjData(self.model)
         self._camera = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(self._camera)
         self._camera.type = mujoco.mjtCamera.mjCAMERA_FIXED
         self._camera.fixedcamid = int(self.model.camera("policy_rgb").id)
-        self._render_option = mujoco.MjvOption()
+
+    def _verify_render_contract(self, mujoco) -> None:
+        """Reject model/option changes that would make the field list incomplete."""
+
+        mismatches = []
+        version = str(getattr(mujoco, "__version__", ""))
+        if version != "3.10.0":
+            mismatches.append(f"mujoco_version={version!r} (expected '3.10.0')")
+
+        for name, expected in self._RENDER_MODEL_COUNTS.items():
+            actual = int(getattr(self.model, name, -1))
+            if actual != expected:
+                mismatches.append(f"{name}={actual} (expected {expected})")
+
+        # Resolve the named dynamic elements before creating the Renderer.  A
+        # fixed policy camera and target-body-com light both require their
+        # derived pose arrays in the snapshot; changing either invalidates the
+        # eight-field assumption.
+        try:
+            camera_id = int(self.model.camera("policy_rgb").id)
+            light_id = int(self.model.light("spotlight").id)
+            target_body = int(self.model.body("link8").id)
+            goal_body = int(self.model.body("goal_area").id)
+            self.model.site("grasp_tcp")
+            self.model.site("goal_fill")
+        except Exception as exc:  # pragma: no cover - guarded model contract
+            mismatches.append(f"required named visual element missing: {exc}")
+        else:
+            if camera_id != 0:
+                mismatches.append(f"policy_rgb camera id={camera_id} (expected 0)")
+            if int(self.model.cam_mode[camera_id]) != int(mujoco.mjtCamLight.mjCAMLIGHT_FIXED):
+                mismatches.append("policy_rgb camera is not fixed")
+            if light_id != 0:
+                mismatches.append(f"spotlight id={light_id} (expected 0)")
+            if int(self.model.light_mode[light_id]) != int(mujoco.mjtCamLight.mjCAMLIGHT_TARGETBODYCOM):
+                mismatches.append("spotlight is not targetbodycom")
+            if int(self.model.light_targetbodyid[light_id]) != target_body:
+                mismatches.append("spotlight target is not link8")
+            if int(self.model.body_mocapid[goal_body]) != 0:
+                mismatches.append("goal_area is not mocap body 0")
+
+        flags = tuple(bool(value) for value in self._render_option.flags)
+        if flags != self._RENDER_DEFAULT_FLAGS:
+            mismatches.append(f"MjvOption.flags={flags!r} differs from MuJoCo 3.10 defaults")
+        if tuple(int(value) for value in self._render_option.geomgroup) != (1, 1, 1, 0, 0, 0):
+            mismatches.append("geomgroup is not the default with collision group 3 disabled")
+        if tuple(int(value) for value in self._render_option.sitegroup) != (1, 1, 1, 0, 0, 0):
+            mismatches.append("sitegroup differs from the required default")
+        if tuple(int(value) for value in self._render_option.tendongroup) != (1, 1, 1, 0, 0, 0):
+            mismatches.append("tendongroup differs from the required default")
+        if int(self._render_option.frame) != int(mujoco.mjtFrame.mjFRAME_NONE):
+            mismatches.append("MjvOption.frame is not mjFRAME_NONE")
+        if int(self._render_option.label) != int(mujoco.mjtLabel.mjLABEL_NONE):
+            mismatches.append("MjvOption.label is not mjLABEL_NONE")
+
+        if mismatches:
+            raise RuntimeError(
+                "Piper RGB render-only snapshot contract mismatch; refusing fast path: "
+                + "; ".join(mismatches)
+            )
+
+    @property
+    def render_timing(self) -> dict[str, float | int]:
+        """Return cumulative render/encoder transfer timings for diagnostics."""
+
+        return dict(self._render_timing)
+
+    def _render_snapshot(self, selected: list[int]) -> dict[str, Any]:
+        """Copy only visual pose arrays for selected worlds to the host.
+
+        ``mujoco_warp.get_data_into`` is intentionally not used here.  Its
+        field-by-field ``.numpy()[world_id]`` calls copy the complete leading
+        world dimension once per selected world.  The direct Torch views below
+        gather each visual field once, then copy only the requested rows.
+        """
+
+        if not selected:
+            return {}
+        transfer_started = time.perf_counter()
+        self.base_env._wp.synchronize()
+        world_ids = self._torch.as_tensor(
+            selected,
+            dtype=self._torch.long,
+            device=self.device,
+        )
+        data = self.base_env._warp_data
+        to_torch = self.base_env._wp.to_torch
+        snapshot = {}
+        for field in self._RENDER_SNAPSHOT_FIELDS:
+            source = getattr(data, field, None)
+            if source is None:
+                raise RuntimeError(f"MuJoCo-Warp data is missing required render field {field!r}")
+            device_field = to_torch(source)
+            if device_field.ndim == 0 or int(device_field.shape[0]) != self.num_envs:
+                raise RuntimeError(
+                    f"MuJoCo-Warp render field {field!r} has leading shape "
+                    f"{tuple(device_field.shape)!r}; expected {self.num_envs} worlds"
+                )
+            snapshot[field] = (
+                device_field.index_select(0, world_ids)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        self._render_timing["render_field_transfers"] += len(self._RENDER_SNAPSHOT_FIELDS)
+        self._render_timing["render_transfer_seconds"] += time.perf_counter() - transfer_started
+        return snapshot
+
+    def _populate_render_data(self, snapshot: dict[str, Any], row: int) -> None:
+        """Populate the reusable host MjData from one visual snapshot row."""
+
+        for field in self._RENDER_SNAPSHOT_FIELDS:
+            target = getattr(self._render_data, field)
+            value = snapshot[field][row]
+            # MuJoCo stores matrix arrays flattened as (..., 9), while Warp's
+            # Torch view exposes (..., 3, 3).  Reshape handles both forms and
+            # performs one host-to-host copy into the reusable MjData.
+            target[...] = value.reshape(target.shape)
 
     def _render_rgb(self, indices: Iterable[int]):
         self._ensure_renderer()
         selected = [int(index) for index in indices]
         if any(index < 0 or index >= self.num_envs for index in selected):
             raise IndexError("RGB render index outside the batched environment")
-        self.base_env._wp.synchronize()
+        if not selected:
+            return []
+        snapshot = self._render_snapshot(selected)
+        render_started = time.perf_counter()
         frames = []
-        for world_id in selected:
-            self.base_env._mjw.get_data_into(
-                self._render_data,
-                self.model,
-                self.base_env._warp_data,
-                world_id=world_id,
-            )
-            self._renderer.update_scene(
-                self._render_data,
-                camera=self._camera,
-                scene_option=self._render_option,
-            )
-            frames.append(self._renderer.render().copy())
+        try:
+            for row in range(len(selected)):
+                self._populate_render_data(snapshot, row)
+                self._renderer.update_scene(
+                    self._render_data,
+                    camera=self._camera,
+                    scene_option=self._render_option,
+                )
+                frames.append(self._renderer.render().copy())
+        finally:
+            self._render_timing["render_calls"] += 1
+            self._render_timing["render_frames"] += len(frames)
+            self._render_timing["render_seconds"] += time.perf_counter() - render_started
         return frames
 
     def _encode(self, frames):
@@ -286,12 +496,20 @@ class PiperRGBEnv:
         if not frames:
             return self._torch.empty((0, self.vision_feature_dim), device=self.device)
         batch = np.stack(frames, axis=0)
-        encode = getattr(self.encoder, "encode", None)
-        if callable(encode):
-            features = encode(batch)
-        else:
-            tensor = self._torch.as_tensor(batch, device=self.device)
-            features = self.encoder(tensor)
+        encode_started = time.perf_counter()
+        try:
+            encode = getattr(self.encoder, "encode", None)
+            if callable(encode):
+                features = encode(batch)
+            else:
+                tensor = self._torch.as_tensor(batch, device=self.device)
+                features = self.encoder(tensor)
+        finally:
+            self._render_timing["encode_calls"] += 1
+            self._render_timing["encode_frames"] += len(frames)
+            self._render_timing["encode_host_dispatch_seconds"] += (
+                time.perf_counter() - encode_started
+            )
         if not isinstance(features, self._torch.Tensor):
             features = self._torch.as_tensor(features, device=self.device)
         features = features.to(device=self.device, dtype=self._torch.float32)

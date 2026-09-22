@@ -1,0 +1,5 @@
+# Images contain dependencies only; launchers bind-mount the project at runtime.
+# Keep models, training runs, caches and local references out of the build context.
+**
+!Dockerfile*
+!requirements*.txt

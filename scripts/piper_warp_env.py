@@ -41,14 +41,17 @@ class PiperWarpEnv:
         ``above_cube`` and ``home`` force one reset pose for every world.
     """
 
-    # The actor emits six normalized absolute arm targets and one normalized
-    # gripper opening target.  The policy no longer runs Cartesian IK inside a
-    # rollout step; CPU IK is used only to construct reset states.
+    # The actor emits six normalized incremental arm-target commands and one
+    # normalized incremental gripper command. The policy no longer runs
+    # Cartesian IK inside a rollout step; CPU IK is used only to construct
+    # reset states.
     num_actions = 7
-    # Reward-v2's placement latch is retained, followed by the previous raw
+    action_semantics = "incremental_joint_targets_v1"
+    action_contract = "raw_si_incremental_joint_v1"
+    # Reward-v3's placement latch is retained, followed by the previous raw
     # action.  The latter keeps the action-rate term Markov under slew limits.
     num_observations = 63
-    reward_version = 2
+    reward_version = 3
     recontact_penalty = 0.2
     physics_timestep = 0.002
     control_hz = 50
@@ -205,8 +208,8 @@ class PiperWarpEnv:
             "num_envs": self.num_envs,
             "num_obs": self.num_observations,
             "num_actions": self.num_actions,
-            "action_semantics": "absolute_joint_targets_v1",
-            "action_contract": "raw_si_direct_joint_v1",
+            "action_semantics": self.action_semantics,
+            "action_contract": self.action_contract,
             "observation_version": "policy_critic_sensor_history_v1",
             "decimation": self.frame_skip,
             "episode_length": self.max_episode_length,
@@ -822,16 +825,10 @@ class PiperWarpEnv:
         self.stable_steps[worlds] = 0
         self.last_ik_error[worlds] = 0.0
         self._last_success[worlds] = False
-        # Previous normalized commands are initialized to the reset targets,
-        # so holding the reset pose has zero action-rate penalty.
-        normalized_joints = torch.clamp(
-            (joints - self._joint_mid) / self._joint_half_range,
-            -1.0,
-            1.0,
-        )
-        self._last_actions[worlds] = torch.cat(
-            (normalized_joints, torch.ones((count, 1), device=self.device)), dim=1
-        )
+        # Incremental actions are zero-centered: zero holds the reset
+        # actuator targets. The action history is therefore zero at every
+        # episode boundary, avoiding a reset-dependent command bias.
+        self._last_actions[worlds] = 0.0
         self._previous_potential[worlds] = self._potential()[worlds]
         self._start_home[worlds] = start_home
 
@@ -960,12 +957,12 @@ class PiperWarpEnv:
         return torch.where(self.has_lifted, post, pre)
 
     def _apply_joint_target_action(self, actions):
-        """Apply direct normalized absolute joint/gripper targets.
+        """Apply normalized incremental joint/gripper target commands.
 
-        The policy action is mapped to the midpoint/half-range of the six arm
-        joint limits and to the physical 0--35 mm gripper opening.  The
-        actuator targets are slew-limited at the 50 Hz policy period; qpos is
-        changed only by MuJoCo-Warp integration.
+        Each arm action requests one target-rate increment in radians and the
+        gripper action requests one target-rate increment in meters. The
+        resulting actuator targets are clamped to the existing safe limits;
+        qpos is changed only by MuJoCo-Warp integration.
         """
 
         torch = self._torch
@@ -980,27 +977,22 @@ class PiperWarpEnv:
         previous_actions = self._last_actions.clone()
         action_delta = actions - previous_actions
 
-        desired_joints = self._joint_mid + self._joint_half_range * actions[:, :6]
+        previous_joints = self._ctrl[:, self._arm_actuators]
+        desired_joints = previous_joints + self.joint_target_rate * actions[:, :6]
         desired_joints = torch.clamp(
             desired_joints, self._action_target_low, self._action_target_high
         )
-        previous_joints = self._ctrl[:, self._arm_actuators]
-        applied_joints = torch.maximum(
-            torch.minimum(desired_joints, previous_joints + self.joint_target_rate),
-            previous_joints - self.joint_target_rate,
-        )
-        desired_gripper = 0.5 * 0.035 * (actions[:, 6] + 1.0)
         previous_gripper = self._ctrl[:, self.gripper_actuator]
-        applied_gripper = torch.maximum(
-            torch.minimum(desired_gripper, previous_gripper + self.gripper_scale),
-            previous_gripper - self.gripper_scale,
-        ).clamp(0.0, 0.035)
-        # Position actuator targets are the only command writes during step;
-        # qpos changes below come exclusively from MuJoCo-Warp integration.
-        self._arm_ctrl = applied_joints
-        self._ctrl[:, self._arm_actuators] = applied_joints
-        self._ctrl[:, self.gripper_actuator] = applied_gripper
-        self.gripper_target = applied_gripper
+        desired_gripper = (previous_gripper + self.gripper_scale * actions[:, 6]).clamp(
+            0.0, 0.035
+        )
+        # The target-rate increments are the action slew limit. Position
+        # actuator targets are the only command writes; qpos changes below
+        # come exclusively from MuJoCo-Warp integration.
+        self._arm_ctrl = desired_joints
+        self._ctrl[:, self._arm_actuators] = desired_joints
+        self._ctrl[:, self.gripper_actuator] = desired_gripper
+        self.gripper_target = desired_gripper
         self._last_actions = actions
         self._last_action_delta = action_delta
         self.last_ik_error.zero_()
@@ -1208,7 +1200,7 @@ class PiperWarpEnv:
         return extras
 
     def step(self, actions):
-        """Apply direct targets, advance ten 2 ms Warp substeps, and reset done worlds."""
+        """Apply incremental targets, advance ten 2 ms substeps, and reset done worlds."""
 
         if self._closed:
             raise RuntimeError("PiperWarpEnv is closed")
@@ -1230,7 +1222,7 @@ class PiperWarpEnv:
         self.recontact_penalty_total += self.recontact_penalty * recontact.to(torch.float32)
         release_gate = self.has_lifted & inside & on_table & released & ~robot_contact
         self.has_placed |= release_gate
-        valid_place = self.has_lifted & inside & on_table & still & released
+        valid_place = release_gate & still
         self.stable_steps = torch.where(valid_place, self.stable_steps + 1, torch.zeros_like(self.stable_steps))
         success = self.stable_steps >= self.settle_steps
         failed = (cube[:, 2] < -0.025) | (torch.linalg.vector_norm(cube[:, :2], dim=1) > 0.75)
