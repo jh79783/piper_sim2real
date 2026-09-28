@@ -30,7 +30,7 @@ import torch  # noqa: E402
 import isaaclab.sim as sim_utils  # noqa: E402
 from isaaclab.assets import Articulation  # noqa: E402
 
-from piper_sim2real.robot_cfg import ARM_JOINTS, FINGER_JOINTS, FINGER_OPEN, PIPER_CFG  # noqa: E402
+from piper_sim2real.assets import ARM_JOINTS, FINGER_JOINTS, FINGER_OPEN, PIPER_CFG  # noqa: E402
 
 EYE = (0.9, 0.9, 0.6)
 TARGET = (0.0, 0.0, 0.25)

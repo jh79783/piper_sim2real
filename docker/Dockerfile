@@ -16,8 +16,7 @@ ENV ACCEPT_EULA=Y \
     PYTHONUNBUFFERED=1 \
     ISAACSIM_PATH=/isaac-sim \
     ISAACLAB_PATH=/workspace/isaaclab \
-    PROJECT_DIR=/workspace/piper_sim2real \
-    PYTHONPATH=/workspace/piper_sim2real
+    PROJECT_DIR=/workspace/piper_sim2real
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends sudo git less vim \
@@ -73,6 +72,14 @@ RUN set -eux; \
 COPY docker/requirements.txt /tmp/requirements.txt
 RUN /isaac-sim/python.sh -m pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm -f /tmp/requirements.txt
+
+# Editable install of the Isaac Lab extension package.  It is installed at the
+# same path the project is later bind-mounted to, so the running container
+# imports the live host sources; only rebuild when setup.py changes.
+COPY source/piper_sim2real /workspace/piper_sim2real/source/piper_sim2real
+RUN /isaac-sim/python.sh -m pip install --no-cache-dir --no-build-isolation \
+        -e /workspace/piper_sim2real/source/piper_sim2real \
+    && chown -R "${USER_UID}:${USER_GID}" /workspace/piper_sim2real
 
 USER ${USERNAME}
 WORKDIR /workspace/piper_sim2real

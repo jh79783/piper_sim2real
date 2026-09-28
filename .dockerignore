@@ -1,2 +1,5 @@
 *
 !docker/requirements.txt
+!source/
+source/**/__pycache__
+source/**/*.egg-info

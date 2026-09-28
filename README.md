@@ -31,7 +31,7 @@ display. Training should stay headless.
 
 `assets/piper_description` holds the official AgileX URDF and meshes
 (see its README for the upstream commit and local changes).
-`piper_sim2real/robot_cfg.py` defines `PIPER_CFG`; the URDF is converted to USD
+`piper_sim2real.assets.PIPER_CFG` defines the articulation; the URDF is converted to USD
 on first spawn and cached under `.cache/assets/piper`.
 
 ```bash
@@ -39,3 +39,21 @@ bash scripts/docker.sh exec python scripts/spawn_piper.py                   # GU
 bash scripts/docker.sh exec python scripts/spawn_piper.py --headless \
     --steps 300 --snapshot runs/spawn_piper.png                             # headless screenshot
 ```
+
+## Layout
+
+Generated from the Isaac Lab external-project template (`isaaclab.sh --new`).
+
+```
+source/piper_sim2real/          # Isaac Lab extension, pip install -e'd in the image
+  piper_sim2real/assets/        # robot configs (PIPER_CFG)
+  piper_sim2real/tasks/manager_based/<task>/   # env cfg + agents/, gym.register in __init__.py
+scripts/rsl_rl/                 # template train.py / play.py
+scripts/list_envs.py            # registered Piper-* tasks
+scripts/spawn_piper.py          # spawn + joint sweep
+assets/piper_description/       # AgileX URDF + meshes
+docker/                         # Dockerfile, compose
+```
+
+Rebuild the image after changing `source/piper_sim2real/setup.py`; Python
+sources are imported live from the bind mount.
