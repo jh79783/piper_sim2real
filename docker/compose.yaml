@@ -1,0 +1,46 @@
+# Long-lived Isaac Sim dev container for Piper sim2real.
+#
+# Drive it through scripts/docker.sh, which fills in HOST_UID/HOST_GID and the
+# X11 cookie.  Plain `docker compose -f docker/compose.yaml ...` also works when
+# the host user is 1000:1000.
+name: piper-sim2real
+
+services:
+  isaac:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        USER_UID: ${HOST_UID:-1000}
+        USER_GID: ${HOST_GID:-1000}
+    image: piper-sim2real/isaac:5.1
+    container_name: piper-isaac
+    init: true
+    command: ["sleep", "infinity"]
+    gpus: all
+    ipc: host
+    # Host networking exposes Isaac Sim livestream and TensorBoard ports
+    # without per-port mapping.
+    network_mode: host
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      DISPLAY: ${DISPLAY:-}
+      XAUTHORITY: /tmp/.Xauthority
+    volumes:
+      - ..:/workspace/piper_sim2real
+      # Persistent state lives in named volumes, so recreating the container
+      # keeps shader/kernel caches, downloaded assets and shell history.
+      - home:/home/dev
+      - kit-cache:/isaac-sim/kit/cache
+      - kit-logs:/isaac-sim/kit/logs
+      - kit-data:/isaac-sim/kit/data
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - ${XAUTH_FILE:-/dev/null}:/tmp/.Xauthority:ro
+    working_dir: /workspace/piper_sim2real
+
+volumes:
+  home:
+  kit-cache:
+  kit-logs:
+  kit-data:

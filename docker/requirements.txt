@@ -1,0 +1,2 @@
+# Extra Python packages on top of the NGC Isaac Lab 2.3.2 image
+# (which already provides torch, isaaclab, rsl-rl-lib, tensorboard, pytest).

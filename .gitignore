@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.env
+
+# Training outputs and local caches
+/runs/
+/logs/
+/outputs/
+/.cache/
