@@ -26,3 +26,16 @@ running container.
 GUI: the container gets the host `DISPLAY`, X11 socket and Xauthority cookie,
 so Isaac Lab scripts launched without `--headless` open a window on the host
 display. Training should stay headless.
+
+## Piper asset
+
+`assets/piper_description` holds the official AgileX URDF and meshes
+(see its README for the upstream commit and local changes).
+`piper_sim2real/robot_cfg.py` defines `PIPER_CFG`; the URDF is converted to USD
+on first spawn and cached under `.cache/assets/piper`.
+
+```bash
+bash scripts/docker.sh exec python scripts/spawn_piper.py                   # GUI, joint sweep
+bash scripts/docker.sh exec python scripts/spawn_piper.py --headless \
+    --steps 300 --snapshot runs/spawn_piper.png                             # headless screenshot
+```
