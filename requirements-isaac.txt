@@ -1,0 +1,7 @@
+# Extra packages for the piper-isaac:5.1 image (installed into Isaac Sim's
+# bundled Python 3.11).  Isaac Lab, torch and rsl-rl-lib come from the NGC base
+# image and are intentionally not listed, so pip never replaces the CUDA wheels.
+#
+# mujoco: asset-build time only (MJCF compile -> explicit collision primitives).
+mujoco==3.3.7
+pytest==8.4.2
